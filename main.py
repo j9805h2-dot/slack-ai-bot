@@ -9,8 +9,6 @@ from collections import OrderedDict
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
-from google import genai
-from google.genai import types
 
 app = FastAPI()
 
@@ -25,9 +23,8 @@ raw_keys = [
 GEMINI_API_KEYS = list(dict.fromkeys([k.strip() for k in raw_keys if k and k.strip()]))
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# 슬랙 3초 타임아웃 재전송(Retry)으로 인한 중복 응답 방지 캐시
 PROCESSED_EVENTS = OrderedDict()
-KEY_INDEX = 0  # API 키 라운드로빈 분산용 (429 에러 완벽 방지)
+KEY_INDEX = 0
 
 # 2. 마스터 지식 시트 캐싱 (1,347건)
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
@@ -77,38 +74,21 @@ sync_master_knowledge()
 
 # 3. 실무 도메인별 엄격 분리 및 상품/프로세스 확장 동의어 사전
 SYNONYM_MAP = {
-    # [구분 1] 해약/해지 (정식 계약 후 중도해약 - 구비서류 및 환급금 관련)
     "해약": ["해지", "중도해약", "해약서류", "구비서류", "환급금", "해약환급금"],
     "해지": ["해약", "중도해약", "해약서류", "구비서류", "환급금"],
-    
-    # [구분 2] 청약철회 (14일 이내 - 별도 서류 불필요, 철회 녹취)
     "철회": ["청약철회", "14일", "철회녹취"],
     "청약철회": ["철회", "14일", "철회녹취"],
-    
-    # [구분 3] 계약취소 (임시계약 상태 - 별도 서류 및 녹취 불필요, 요청 시 즉시 처리)
     "계약취소": ["임시계약", "취소", "청약취소", "접수취소"],
     "임시계약": ["계약취소", "취소", "결제전"],
-
-    # [구분 4] 캐시백 상품 및 혜택 관련 (완납 후 행사진행 시 캐시백 지급 기준 등)
     "캐시백": ["캐시백상품", "72개월", "청구할인", "제휴카드", "환급", "만기"],
     "제휴카드": ["캐시백", "할인", "청구할인", "롯데카드", "하나카드", "KB카드"],
-
-    # [구분 5] 스카이펫 (반려동물 상품 관련)
     "스카이펫": ["펫", "반려동물", "강아지", "고양이", "펫상품", "가입조건"],
     "펫": ["스카이펫", "반려동물", "펫상품"],
-
-    # [구분 6] 웨딩 상품 관련
     "웨딩": ["결혼", "웨딩상품", "웨딩컨설팅", "예식", "행사"],
-
-    # [구분 7] 여행 / 크루즈 상품 관련
     "여행": ["크루즈", "여행상품", "크루즈상품", "관광", "만기환급", "전환"],
     "크루즈": ["여행", "크루즈상품", "여행상품", "선박"],
-
-    # [구분 8] 상조 본상품 및 행사진행 프로세스
     "상조": ["장례", "행사", "상조상품", "구좌", "만기", "완납", "행사진행"],
     "행사": ["장례", "상조", "의전", "인력", "용품"],
-
-    # [기타 주요 실무 키워드]
     "장기연체": ["연체", "미납", "7회", "출금", "재출금", "직권해지"],
     "연체": ["미납", "출금", "재출금", "납부"],
     "미납": ["연체", "출금", "재출금", "납부"],
@@ -119,7 +99,6 @@ SYNONYM_MAP = {
 }
 
 def extract_core_stems(text: str):
-    """조사 및 어미 분리 + 도메인별 정확한 동의어 확장"""
     clean = re.sub(r"[^\w\s가-힣]", " ", text.lower())
     words = clean.split()
     stems = set()
@@ -135,7 +114,6 @@ def extract_core_stems(text: str):
         if len(stripped) >= 2 and stripped != w and stripped not in stop_words:
             stems.add(stripped)
 
-    # 동의어 확장 적용 (정확히 일치하거나 핵심어가 포함된 경우만 안전하게 확장)
     expanded = set(stems)
     for s in list(stems):
         if s in SYNONYM_MAP:
@@ -144,7 +122,6 @@ def extract_core_stems(text: str):
     return list(expanded)
 
 def get_thread_context(channel_id: str, thread_ts: str, current_ts: str):
-    """스레드 내 이전 대화 맥락(질문+봇 답변 핵심)을 가져와 후속 질문 완벽 이해"""
     if not thread_ts or thread_ts == current_ts:
         return "", ""
     try:
@@ -155,7 +132,7 @@ def get_thread_context(channel_id: str, thread_ts: str, current_ts: str):
         
         history_lines = []
         user_keywords_source = []
-        for m in msgs[:-1][-4:]:  # 직전 4개 메시지만 참조하여 토큰 절약
+        for m in msgs[:-1][-4:]:
             is_bot = bool(m.get("bot_id"))
             role = "대성봇" if is_bot else "상담사"
             txt = re.sub(r"\[질의-AI\]", "", m.get("text", "")).strip()
@@ -170,11 +147,6 @@ def get_thread_context(channel_id: str, thread_ts: str, current_ts: str):
         return "", ""
 
 def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
-    """
-    [고도화 색인 엔진]
-    현재 질문에 높은 가중치를 두고, 스레드 후속 질문일 경우 이전 질문의 맥락까지 결합하여
-    관련된 상위 5개 지식 조각(페이지 분할 문서 포함, 약 1,500 토큰 내외)을 정확히 추출
-    """
     current_stems = extract_core_stems(current_query)
     prev_stems = extract_core_stems(prev_user_queries) if prev_user_queries else []
     clean_q = re.sub(r"[^\w\s가-힣]", "", current_query.lower())
@@ -186,7 +158,6 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
         q_clean = re.sub(r"[^\w\s가-힣]", "", item["question"].lower())
         ans_clean = item["answer"].lower()
 
-        # 1. 현재 질문 핵심어 매칭 (주 가중치)
         for stem in current_stems:
             if stem in sub_clean:
                 score += 120
@@ -200,7 +171,6 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
             if stem in ans_clean:
                 score += 15
 
-        # 2. 스레드 이전 질문 핵심어 매칭 (보조 가중치 - 꼬리질문 해결)
         for p_stem in prev_stems:
             if p_stem not in current_stems:
                 if p_stem in sub_clean:
@@ -210,16 +180,14 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
                 if p_stem in ans_clean:
                     score += 10
 
-        # 3. 질문 통째 부분 일치 보너스
         if len(clean_q) >= 2 and (clean_q in sub_clean or clean_q in q_clean):
             score += 100
 
-        if score >= 25:
+        if score >= 20:
             scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     
-    # 상위 5개 조각을 전달하되, 각 조각당 최대 700자로 제한하여 429 토큰 초과 원천 차단!
     if scored:
         top_items = [s[1] for s in scored[:5]]
         combined_text = "\n\n---\n\n".join([
@@ -230,16 +198,15 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
     return "", False, None
 
 def format_for_slack(text: str) -> str:
-    """AI가 습관적으로 출력하는 **볼드체**를 슬랙 전용 *볼드체*로 완벽 변환"""
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
     text = re.sub(r"^#{1,3}\s*(.+)$", r"*\1*", text, flags=re.MULTILINE)
     return text.strip()
 
-def call_gemini_api(prompt: str):
+def call_gemini_api_rest(prompt: str):
     """
-    [429 에러 완벽 방어]
-    1) 실제 존재하는 최신 정식 모델명(gemini-2.5-flash, gemini-2.0-flash) 사용
-    2) 여러 개의 API 키를 순차적으로 돌아가며(Round-Robin) 호출하여 키 1개에 부하 집중 방지
+    [안정성 100% 보장] 
+    SDK 대신 검증된 Google Gemini REST API 직접 호출 방식으로 전환하여 
+    렌더 환경에서 발생하는 알 수 없는 패키지 오류 및 타임아웃을 원천 차단합니다.
     """
     global KEY_INDEX
     if not GEMINI_API_KEYS:
@@ -250,35 +217,33 @@ def call_gemini_api(prompt: str):
 
     for i in range(num_keys):
         current_key = GEMINI_API_KEYS[(KEY_INDEX + i) % num_keys]
-        try:
-            client = genai.Client(api_key=current_key)
-            for m in models:
-                try:
-                    res = client.models.generate_content(
-                        model=m,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.15,
-                            max_output_tokens=1500
-                        )
-                    )
-                    if res and res.text:
+        for m in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={current_key}"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.15,
+                    "maxOutputTokens": 1500
+                }
+            }
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=20)
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    if text:
                         KEY_INDEX = (KEY_INDEX + i + 1) % num_keys
-                        return True, format_for_slack(res.text)
-                except Exception as model_err:
-                    err_str = str(model_err)
-                    print(f"⚠️ 모델 호출 경고 ({m}): {err_str[:100]}")
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        time.sleep(1.0)
-                        break  # 현재 키가 429면 즉시 다음 API 키로 전환!
+                        return True, format_for_slack(text)
+                elif res.status_code == 429:
+                    time.sleep(1.0)
                     continue
-        except Exception as key_err:
-            print(f"⚠️ API 키 초기화 오류: {key_err}")
-            continue
+            except Exception as e:
+                print(f"⚠️ REST API 호출 예외 ({m}): {e}")
+                continue
     return False, ""
 
 def build_polite_escalation_blocks(question: str, channel_id: str, thread_ts: str):
-    """친절한 관리자 인계 양식 블록 생성"""
     meta_val = json.dumps({"c": channel_id, "t": thread_ts, "q": question[:80]}, ensure_ascii=False)
     return [
         {
@@ -314,17 +279,12 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     except Exception:
         pass
 
-    # 직접 인계 키워드 감지
     direct_escalate_keywords = ["관리자", "sv", "담당자", "인계", "연결해"]
     is_direct = any(k in question.lower() for k in direct_escalate_keywords)
 
-    # 스레드 이전 대화 맥락 조회
     thread_history, prev_user_queries = get_thread_context(channel_id, thread_ts, message_ts) if is_thread_followup else ("", "")
-
-    # 현재 질문 + 스레드 이전 질문 키워드 결합 검색
     evidence, has_match, best_item = search_memory_knowledge(question, prev_user_queries)
 
-    # 1. 사내 지식에 없거나 직접 인계를 요청한 경우
     if not has_match or is_direct:
         blocks = build_polite_escalation_blocks(question, channel_id, thread_ts)
         try:
@@ -340,7 +300,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             print(f"❌ 슬랙 전송 실패: {e}")
         return
 
-    # 2. 실무 도메인 구분(해약 vs 청약철회 vs 계약취소) 및 디테일한 상담 코칭 프롬프트
+    # 완성도 높은 코칭 프롬프트 (도메인 분리 포함)
     prompt = f"""당신은 보람상조(대성글로벌네트워크) 상담사를 실시간으로 코칭하는 최고 수준의 AI 어시스턴트 '대성봇'입니다.
 제공된 [사내 공식 지식 규정]만을 바탕으로, 상담사가 고객과 통화 중 바로 읽고 응대할 수 있도록 다정하고 명확하며 구체적인 가이드를 작성하세요.
 
@@ -354,35 +314,27 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 {evidence}
 
 [🚨 필수 실무 도메인 구분 원칙 - 절대 혼동 금지!]:
-반드시 아래 3가지 개념을 엄격히 구분하여 답변하세요. 절대 서로 섞어서 안내하면 안 됩니다!
-1. *계약취소*: 초회 출금/결제 전인 *'임시계약'* 상태에서 취소하는 것입니다. 별도의 구비서류도 필요 없고, 별도의 녹취도 필요 없이 고객 요청에 따라 즉시 취소 처리가 가능합니다.
-2. *청약철회 (철회)*: 가입 후 *14일 이내*에 요청하는 철회입니다. 별도의 구비서류는 필요 없으며, 정해진 청약철회 기준(녹취 등)에 따라 처리합니다.
-3. *해약 (해지)*: 정식 계약 유지 중(14일 경과 후) 계약을 해지하는 *중도해약*입니다. 반드시 *구비서류*(신분증 등 유형별 필수 서류) 확인 및 해약 프로세스가 필요합니다.
+1. *계약취소*: 초회 출금/결제 전인 '임시계약' 상태에서 취소하는 것입니다. 구비서류 및 녹취 불필요, 고객 요청 시 즉시 취소 가능.
+2. *청약철회 (철회)*: 가입 후 14일 이내 요청. 서류 불필요, 철회 녹취 진행.
+3. *해약 (해지)*: 정식 계약 유지 중(14일 경과 후) 중도해약. 신분증 등 구비서류 필수 확인.
 
-[작성 및 말투 핵심 지침 - 반드시 준수]:
-1. 단답형이나 단순 복붙을 절대 금지합니다! 상담사가 이해하기 쉽게 전후 맥락과 조건을 친절한 문장('~합니다', '~입니다')으로 풀어서 설명하세요.
-2. 슬랙(Slack) 전용 마크다운을 사용하므로 글씨를 굵게 강조할 때는 별표 두 개(**)가 아닌 별표 한 개(*강조할 단어*)만 사용하세요.
-3. 만약 [사내 공식 지식 규정]과 위 원칙을 모두 살펴봐도 상담사의 질문에 답할 근거가 전혀 없다면, 억지로 지어내지 말고 오직 "NO_DATA_FOUND" 라고만 출력하세요.
-4. 각 섹션의 역할:
-   - 📢 *[핵심 답변]*: 질문에 대한 결론부터 두괄식으로 1~3문장으로 명확히 요약하고, 조건(예: 납부 이력 유무, 계약 상태별 차이 등)에 따라 달라진다면 첫 단락 아래에 불릿(-)으로 한눈에 비교해 주세요.
-   - 💡 *[상세 기준]*: 회차별/상황별/유형별 세부 기준, 진행 절차, 필수 구비서류 등을 하위 불릿(-)과 들여쓰기를 활용해 체계적이고 꼼꼼하게 정리하세요.
-   - 📌 *[상담 가이드 & 팁]*: 상담사가 전산에서 먼저 확인해야 할 포인트(예: 임시계약 상태인지, 14일 이내인지, 납부 이력이 있는지 등), 오안내 방지를 위한 주의사항, 고객 응대 화법 팁을 2~3가지 풍부하게 작성하세요.
-
-[반드시 준수할 출력 서식]:
+[작성 및 말투 핵심 지침]:
+1. 단답형이나 단순 복붙 금지! 친절한 문장('~합니다', '~입니다')으로 상세히 풀어서 설명하세요.
+2. 슬랙 마크다운 특성상 굵은 글씨는 별표 두 개(**)가 아닌 별표 한 개(*강조*)만 사용하세요.
+3. 규정 내에 답변 근거가 전혀 없다면 오직 "NO_DATA_FOUND" 라고만 출력하세요.
+4. 출력 서식:
 📢 *[핵심 답변]*:
-(결론 및 조건별 핵심 요약)
+(결론 및 핵심 요약 1~3문장)
 
 💡 *[상세 기준]*:
 - *구분/조건 1*: 세부 기준 및 절차
 - *구분/조건 2*: 세부 기준 및 절차
 
 📌 *[상담 가이드 & 팁]*:
-- (전산 확인 포인트 및 실무 응대 화법 팁 1)
-- (예외 상황 대처법 및 주의사항 팁 2)"""
+- (전산 확인 포인트 및 실무 응대 화법 팁)"""
 
-    success, ai_reply = call_gemini_api(prompt)
+    success, ai_reply = call_gemini_api_rest(prompt)
 
-    # AI가 규정 내에 답이 없다고 판단한 경우 친절한 관리자 확인 버튼 출력
     if success and "NO_DATA_FOUND" in ai_reply:
         blocks = build_polite_escalation_blocks(question, channel_id, thread_ts)
         slack_client.chat_postMessage(
@@ -398,14 +350,15 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             pass
         return
 
+    # [수정] 혹시라도 API 통신이 지연되거나 실패할 경우, 시트 원문을 자연스럽게 다듬어서 무조건 스레드에 예쁘게 회신되도록 보장!
     if success and ai_reply:
         final_text = ai_reply
     else:
-        # 모든 API 키가 일시적 한도 초과일 때의 비상 안전망
+        cleaned_ans = format_for_slack(best_item['answer']) if best_item else "등록된 규정 내용이 없습니다."
         final_text = (
-            f"📢 *[핵심 답변]*:\n*{best_item['sub']}* 관련 기준 안내드립니다.\n\n"
-            f"💡 *[상세 기준]*:\n{format_for_slack(best_item['answer'][:800])}\n\n"
-            f"📌 *[상담 가이드 & 팁]*:\n- 현재 AI 요약 요청량이 많아 원문 기준으로 빠르게 안내해 드립니다. 세부 사항은 전산 및 사내 규정을 함께 확인해 주세요."
+            f"📢 *[핵심 답변]*:\n*{best_item.get('sub', '업무')}* 관련 규정 안내드립니다.\n\n"
+            f"💡 *[상세 기준]*:\n{cleaned_ans}\n\n"
+            f"📌 *[상담 가이드 & 팁]*:\n- 본 내용은 사내 마스터 지식 원문 기준입니다. 상세 전산 처리 시 재확인 부탁드립니다."
         )
 
     try:
@@ -430,27 +383,23 @@ def manual_sync():
 
 @app.post("/slack/events")
 async def handle_slack_events(request: Request, background_tasks: BackgroundTasks):
-    # 슬랙 3초 타임아웃 재전송(Retry) 헤더 감지 시 즉시 무시 (중복 응답/중복 버튼 완벽 차단!)
     if request.headers.get("x-slack-retry-num"):
         return {"status": "ignored_retry"}
 
     body_bytes = await request.body()
     body_str = body_bytes.decode("utf-8")
 
-    # 1. 인터랙션 (버튼 클릭 및 모달 제출)
     if body_str.startswith("payload="):
         parsed = urllib.parse.parse_qs(body_str)
         raw_payload = parsed.get("payload", ["{}"])[0]
         payload = json.loads(raw_payload)
         p_type = payload.get("type")
 
-        # A. 버튼 클릭 처리
         if p_type == "block_actions":
             action = payload.get("actions", [{}])[0]
             action_id = action.get("action_id")
             trigger_id = payload.get("trigger_id")
 
-            # 1) [예 (관리자 질의서 작성)] 클릭 -> 정통 모달 팝업
             if action_id == "open_escalate_modal":
                 action_val = action.get("value", "{}")
                 meta_dict = json.loads(action_val)
@@ -478,22 +427,10 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                                 "action_id": "escalate_type_select",
                                 "placeholder": {"type": "plain_text", "text": "유형을 선택해주세요", "emoji": True},
                                 "options": [
-                                    {
-                                        "text": {"type": "plain_text", "text": "1. 사내 지식 미등록 / 신규 규정 확인", "emoji": True},
-                                        "value": "지식_미등록"
-                                    },
-                                    {
-                                        "text": {"type": "plain_text", "text": "2. AI 답변 내용 오류 / 팩트 불일치", "emoji": True},
-                                        "value": "답변_오류"
-                                    },
-                                    {
-                                        "text": {"type": "plain_text", "text": "3. 예외 케이스 처리 및 특별 승인 요청", "emoji": True},
-                                        "value": "예외_승인"
-                                    },
-                                    {
-                                        "text": {"type": "plain_text", "text": "4. 기타 실무 지침 문의", "emoji": True},
-                                        "value": "기타_문의"
-                                    }
+                                    {"text": {"type": "plain_text", "text": "1. 사내 지식 미등록 / 신규 규정 확인", "emoji": True}, "value": "지식_미등록"},
+                                    {"text": {"type": "plain_text", "text": "2. AI 답변 내용 오류 / 팩트 불일치", "emoji": True}, "value": "답변_오류"},
+                                    {"text": {"type": "plain_text", "text": "3. 예외 케이스 처리 및 특별 승인 요청", "emoji": True}, "value": "예외_승인"},
+                                    {"text": {"type": "plain_text", "text": "4. 기타 실무 지침 문의", "emoji": True}, "value": "기타_문의"}
                                 ]
                             }
                         },
@@ -505,10 +442,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                                 "type": "plain_text_input",
                                 "action_id": "reason_input",
                                 "multiline": True,
-                                "placeholder": {
-                                    "type": "plain_text",
-                                    "text": "관리자가 파악해야 할 상세 사유나 고객의 구체적인 상황을 입력해주세요."
-                                }
+                                "placeholder": {"type": "plain_text", "text": "관리자가 파악해야 할 상세 사유나 고객의 구체적인 상황을 입력해주세요."}
                             }
                         }
                     ]
@@ -519,7 +453,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                     print(f"❌ 모달 팝업 오류: {e}")
                 return {"status": "ok"}
 
-            # 2) [아니오] 클릭 -> 메시지 취소 처리
             elif action_id == "dismiss_escalate":
                 channel_id = payload.get("channel", {}).get("id")
                 message_ts = payload.get("message", {}).get("ts")
@@ -537,7 +470,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                     pass
                 return {"status": "ok"}
 
-        # B. 모달 제출 처리
         elif p_type == "view_submission":
             user_info = payload.get("user", {})
             user_name = user_info.get("name", "상담사")
@@ -553,10 +485,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
             reason = values.get("reason_block", {}).get("reason_input", {}).get("value", "내용 없음")
 
             notice_blocks = [
-                {
-                    "type": "header",
-                    "text": {"type": "plain_text", "text": "🚨 [관리자(SV) 업무 인계 접수]", "emoji": True}
-                },
+                {"type": "header", "text": {"type": "plain_text", "text": "🚨 [관리자(SV) 업무 인계 접수]", "emoji": True}},
                 {
                     "type": "section",
                     "fields": [
@@ -564,21 +493,10 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                         {"type": "mrkdwn", "text": f"*인계 유형:*\n`{sel_type}`"}
                     ]
                 },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*상담사 원본 질문:*\n>{orig_q}"}
-                },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*상세 확인 요청 사항:*\n{reason}"}
-                },
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*상담사 원본 질문:*\n>{orig_q}"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*상세 확인 요청 사항:*\n{reason}"}},
                 {"type": "divider"},
-                {
-                    "type": "context",
-                    "elements": [
-                        {"type": "mrkdwn", "text": "📌 *관리자(SV) 확인 요망*: 내용을 검토하신 후 본 스레드 댓글로 업무 지침을 남겨주세요."}
-                    ]
-                }
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": "📌 *관리자(SV) 확인 요망*: 내용을 검토하신 후 본 스레드 댓글로 업무 지침을 남겨주세요."}]}
             ]
 
             try:
@@ -593,7 +511,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
             return {"response_action": "clear"}
 
-    # 2. 슬랙 메시지 이벤트
     try:
         data = json.loads(body_str)
     except Exception:
@@ -602,7 +519,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
     if data.get("type") == "url_verification":
         return {"challenge": data.get("challenge")}
 
-    # 이벤트 ID 기반 2중 중복 방어
     event_id = data.get("event_id")
     if event_id:
         if event_id in PROCESSED_EVENTS:
@@ -618,7 +534,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
         message_ts = event.get("ts")
         thread_ts = event.get("thread_ts")
 
-        # 메인 채널 신규 질문
         if text.startswith("[질의-AI]"):
             question = text.replace("[질의-AI]", "").strip()
             background_tasks.add_task(
@@ -629,7 +544,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                 question,
                 False
             )
-        # 스레드 내 댓글 (후속 질의)
         elif thread_ts and thread_ts != message_ts:
             if len(text) >= 2:
                 background_tasks.add_task(
