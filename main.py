@@ -1,8 +1,9 @@
 import os
 import re
-import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
@@ -60,116 +61,3 @@ def search_memory_knowledge(query: str) -> str:
 
         if score > 0:
             matched.append((score, f"[{item['sub']} - {item['question']}]\n{item['answer']}"))
-
-    matched.sort(key=lambda x: x[0], reverse=True)
-    return "\n\n---\n\n".join([m[1] for m in matched[:3]])
-
-def call_gemini_api_direct(prompt: str) -> str:
-    models = ["gemini-2.5-flash", "gemini-1.5-flash"]
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
-    }
-    
-    last_err = ""
-    for key in GEMINI_API_KEYS:
-        for model in models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-            try:
-                res = requests.post(
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=10
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    candidates = data.get("candidates", [])
-                    if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if parts and "text" in parts[0]:
-                            return parts[0]["text"]
-                else:
-                    last_err = f"HTTP {res.status_code}: {res.text[:120]}"
-            except Exception as e:
-                last_err = f"요청 예외: {str(e)}"
-                continue
-
-    return f"⚠️ API 호출 오류 발생: {last_err}"
-
-def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question: str):
-    # 1. 눈 이모지 등록
-    try:
-        slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="eyes")
-    except Exception:
-        pass
-
-    # 2. 로컬 메모리 검색
-    evidence = search_memory_knowledge(question)
-
-    # 3. Gemini 프롬프트 구성 및 호출
-    prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트입니다.
-사내 공식 규정을 바탕으로 신속하고 정확한 실무 답변을 작성하세요.
-
-[상담사 질문]: {question}
-
-[사내 지식 베이스]:
-{evidence if evidence else "관련 기본 규정 준수"}
-
-[답변 작성 가이드]:
-📢 *[핵심 답변]*: (결론 및 필수 구비서류)
-💡 *[상세 기준]*: (상세 내역 및 프로세스)
-📌 *[상담 가이드 & 팁]*: (실무 유의사항)"""
-
-    reply_text = call_gemini_api_direct(prompt)
-
-    # 4. 슬랙 스레드 답변 전송
-    try:
-        slack_client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=reply_text,
-            mrkdwn=True
-        )
-    except Exception as e:
-        print(f"메시지 전송 에러: {e}")
-
-    # 5. 이모지 교체
-    try:
-        slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
-    except Exception:
-        pass
-    try:
-        slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="white_check_mark")
-    except Exception:
-        pass
-
-@app.get("/")
-def health_check():
-    return {"status": "ok", "service": "Slack AI Bot"}
-
-@app.post("/slack/events")
-async def handle_slack_events(request: Request, background_tasks: BackgroundTasks):
-    data = await request.json()
-
-    if data.get("type") == "url_verification":
-        return {"challenge": data.get("challenge")}
-
-    event = data.get("event", {})
-    if event.get("type") == "message" and not event.get("bot_id") and not event.get("subtype"):
-        text = event.get("text", "").strip()
-        channel_id = event.get("channel")
-        message_ts = event.get("ts")
-        thread_ts = event.get("thread_ts", message_ts)
-
-        if text.startswith("[질의-AI]"):
-            question = text.replace("[질의-AI]", "").strip()
-            background_tasks.add_task(
-                async_bot_worker,
-                channel_id,
-                thread_ts,
-                message_ts,
-                question
-            )
-
-    return {"status": "ok"}
