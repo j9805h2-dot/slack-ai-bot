@@ -5,12 +5,10 @@ import io
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
-from google import genai
-from google.genai import types
 
 app = FastAPI()
 
-# 1. 환경변수 로드
+# 1. 환경변수
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 API_KEYS = [
     os.environ.get("GEMINI_API_KEY_1"),
@@ -21,14 +19,13 @@ GEMINI_API_KEYS = [k.strip() for k in API_KEYS if k]
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# 2. 독립형 마스터 지식 시트 설정
+# 2. 마스터 지식 시트 캐싱
 MASTER_SHEET_ID = "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4"
 CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=%F0%9F%93%9AAI_%EB%A7%88%EC%8A%A4%ED%84%B0%EC%A7%80%EC%8B%9D"
 
 CACHED_KNOWLEDGE = []
 
 def sync_master_knowledge():
-    """신규 마스터 지식 시트에서 전수 데이터를 메모리로 고속 로드"""
     global CACHED_KNOWLEDGE
     try:
         res = requests.get(CSV_EXPORT_URL, timeout=8)
@@ -38,7 +35,6 @@ def sync_master_knowledge():
             rows = list(reader)
             
             new_data = []
-            # 2번째 행부터 데이터 적재 (대분류, 소분류, 대표질의, 표준답변, 키워드)
             for r in rows[1:]:
                 if len(r) >= 4:
                     cat = r[0].strip() if len(r) > 0 else ""
@@ -48,14 +44,14 @@ def sync_master_knowledge():
                     kw = r[4].strip() if len(r) > 4 else ""
 
                     if q and a:
-                        keywords_list = [k.strip().lower() for k in kw.split(",") if k.strip()]
-                        keywords_list.extend(re.findall(r"[\w가-힣]+", q.lower()))
+                        kw_list = [k.strip().lower() for k in kw.split(",") if k.strip()]
+                        kw_list.extend(re.findall(r"[\w가-힣]+", q.lower()))
                         new_data.append({
                             "category": cat,
                             "sub": sub,
                             "question": q,
                             "answer": a,
-                            "keywords": list(set(keywords_list))
+                            "keywords": list(set(kw_list))
                         })
 
             if new_data:
@@ -63,14 +59,12 @@ def sync_master_knowledge():
                 print(f"✅ 마스터 지식 로드 성공: 총 {len(CACHED_KNOWLEDGE)}건 캐싱 완료")
                 return len(CACHED_KNOWLEDGE)
     except Exception as e:
-        print(f"⚠️ 시트 동기화 예외: {e}")
+        print(f"⚠️ 시트 로드 예외: {e}")
     return len(CACHED_KNOWLEDGE)
 
-# 서버 시작 시 1회 즉시 로드
 sync_master_knowledge()
 
 def search_memory_knowledge(query: str) -> str:
-    """메모리에 적재된 지식 중 질문과 가장 일치하는 규정 1~3건 추출"""
     clean_q = re.sub(r"[^\w\s가-힣]", " ", query.lower())
     tokens = [t for t in clean_q.split() if len(t) > 1]
 
@@ -82,7 +76,7 @@ def search_memory_knowledge(query: str) -> str:
                 if token in kw or kw in token:
                     score += 5
             if token in item["question"].lower():
-                score += 10
+                score += 15
 
         if score > 0:
             scored.append((score, f"[{item['category']} > {item['sub']} - {item['question']}]\n{item['answer']}"))
@@ -90,62 +84,69 @@ def search_memory_knowledge(query: str) -> str:
     scored.sort(key=lambda x: x[0], reverse=True)
     return "\n\n---\n\n".join([item[1] for item in scored[:3]])
 
-def call_gemini_api(prompt: str) -> str:
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+def call_gemini_direct_rest(prompt: str) -> str:
+    """REST API 직접 호출 (SDK 종속성/동결 현상 원천 차단)"""
+    models = ["gemini-2.5-flash", "gemini-flash-latest"]
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2048
+        }
+    }
+
     last_err = ""
+    for key in GEMINI_API_KEYS:
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            try:
+                res = requests.post(
+                    url,
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=5
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    if parts and "text" in parts[0]:
+                        return parts[0]["text"]
+                else:
+                    last_err = f"API 오류 {res.status_code}: {res.text[:100]}"
+            except Exception as e:
+                last_err = f"호출 예외: {str(e)}"
+                continue
 
-    for api_key in GEMINI_API_KEYS:
-        try:
-            client = genai.Client(api_key=api_key)
-            for model in models_to_try:
-                try:
-                    res = client.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.1,
-                            max_output_tokens=2048
-                        )
-                    )
-                    if res and res.text:
-                        return res.text
-                except Exception as inner_e:
-                    last_err = str(inner_e)
-                    continue
-        except Exception as outer_e:
-            last_err = str(outer_e)
-            continue
-
-    return f"⚠️ API 호출 오류 발생: {last_err}"
+    return f"⚠️ 지식 조회 오류: {last_err}"
 
 def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question: str):
-    # 1. 눈 이모지 등록
+    # 1. 눈 이모지
     try:
         slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="eyes")
     except Exception:
         pass
 
-    # 2. 마스터 지식 검색
+    # 2. 마스터 지식 1,347건 중 관련 규정 검색
     evidence = search_memory_knowledge(question)
 
-    # 3. Gemini 프롬프트 구성
+    # 3. Gemini 프롬프트 구성 및 REST 호출
     prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트입니다.
-반드시 아래 [사내 공식 규정]에 적힌 내용만을 바탕으로 정확하게 답변하세요. 지식 베이스에 없는 내용은 절대 추측하지 마세요.
+반드시 아래 [사내 공식 규정]에 명시된 내용만을 기반으로 정확하게 작성하세요. 지식에 없는 내용은 절대 지어내지 마세요.
 
 [상담사 질문]: {question}
 
 [사내 공식 규정]:
 {evidence if evidence else "관련 공식 규정이 지식 베이스에 등록되어 있지 않습니다."}
 
-[답변 작성 가이드]:
+[답변 가이드]:
 📢 *[핵심 답변]*: (결론 및 필수 구비서류)
-💡 *[상세 기준]*: (상세 내역 및 진행 프로세스)
-📌 *[상담 가이드 & 팁]*: (실무 유의사항 및 안내 팁)
-(※ 규정에 없는 내용일 경우 '사내 공식 지식에 미등록된 항목이므로 SV/관리자 확인이 필요합니다'라고 명시할 것)"""
+💡 *[상세 기준]*: (상세 내역 및 프로세스)
+📌 *[상담 가이드 & 팁]*: (실무 유의사항)
+(※ 규정에 없는 내용일 경우 '사내 공식 지식에 미등록된 항목이므로 SV 확인이 필요합니다' 명시)"""
 
-    reply_text = call_gemini_api(prompt)
+    reply_text = call_gemini_direct_rest(prompt)
 
-    # 4. 슬랙 스레드 답변 전송
+    # 4. 스레드 전송
     try:
         slack_client.chat_postMessage(
             channel=channel_id,
@@ -154,9 +155,9 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             mrkdwn=True
         )
     except Exception as e:
-        print(f"메시지 전송 실패: {e}")
+        print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 5. 이모지 교체
+    # 5. 이모지 교체 (eyes -> white_check_mark)
     try:
         slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
     except Exception:
@@ -170,7 +171,6 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 def health_check():
     return {
         "status": "ok",
-        "service": "Slack AI Bot",
         "loaded_knowledge_count": len(CACHED_KNOWLEDGE)
     }
 
