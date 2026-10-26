@@ -59,8 +59,8 @@ def sync_master_knowledge():
 
                     if q and a:
                         kw_list = [k.strip().lower() for k in kw.split(",") if k.strip()]
-                        kw_list.extend(re.findall(r"[\w가-힣]+", q.lower()))
-                        kw_list.extend(re.findall(r"[\w가-힣]+", sub.lower()))
+                        kw_list.extend(re.findall(r"[\w가-힣&]+", q.lower()))
+                        kw_list.extend(re.findall(r"[\w가-힣&]+", sub.lower()))
                         new_data.append({
                             "category": cat,
                             "sub": sub,
@@ -79,16 +79,20 @@ def sync_master_knowledge():
 
 sync_master_knowledge()
 
-# 3. 동의어 사전
+# 3. 동의어 사전 (상품명 & 특수기호 매핑)
 SYNONYM_MAP = {
+    "b&케어팩": ["비앤케어팩", "b케어팩", "케어팩", "삼성전자", "삼성스토어", "가전구독", "캐시백"],
+    "비앤케어팩": ["b&케어팩", "b케어팩", "케어팩", "삼성전자", "가전구독", "캐시백"],
+    "b케어팩": ["b&케어팩", "비앤케어팩", "케어팩", "삼성전자"],
+    "케어팩": ["b&케어팩", "비앤케어팩", "삼성전자", "가전구독"],
     "해약": ["해지", "중도해약", "해약서류", "구비서류", "환급금", "해약환급금"],
     "해지": ["해약", "중도해약", "해약서류", "구비서류", "환급금"],
     "철회": ["청약철회", "14일", "철회녹취"],
     "청약철회": ["철회", "14일", "철회녹취"],
     "계약취소": ["임시계약", "취소", "청약취소", "접수취소"],
     "임시계약": ["계약취소", "취소", "결제전"],
-    "캐시백": ["캐시백상품", "72개월", "청구할인", "제휴카드", "환급", "만기", "비앤케어팩"],
-    "제휴카드": ["캐시백", "할인", "청구할인", "롯데카드", "하나카드", "KB카드"],
+    "캐시백": ["캐시백상품", "72개월", "청구할인", "제휴카드", "환급", "만기", "b&케어팩"],
+    "제휴카드": ["캐시백", "할인", "청구할인", "롯데카드", "하나카드", "kb카드"],
     "스카이펫": ["펫", "반려동물", "강아지", "고양이", "펫상품", "가입조건"],
     "펫": ["스카이펫", "반려동물", "펫상품"],
     "웨딩": ["결혼", "웨딩상품", "웨딩컨설팅", "예식", "행사"],
@@ -107,19 +111,25 @@ SYNONYM_MAP = {
 }
 
 def extract_core_stems(text: str):
-    clean = re.sub(r"[^\w\s가-힣]", " ", text.lower())
+    """특수문자 & 유지 및 한글/영문 형태소 정밀 분리"""
+    normalized = text.lower().replace("b &", "b&").replace("b and", "b&")
+    clean = re.sub(r"[^\w\s가-힣&]", " ", normalized)
     words = clean.split()
     stems = set()
-    stop_words = {"알려줘", "뭐야", "뭐가", "어떻게", "언제", "얼마", "확인해줘", "답변", "부탁", "경우", "경우는", "관련", "그럼", "만약", "필요해", "하나요", "할까요", "있나요"}
-    josa_pattern = r"(시에는|일때는|할때는|경우에는|경우는|에서는|이라도|시엔|할때|에는|에서|에게|으로|까지|부터|마다|이면|면|의|과|와|을|를|은|는|이|가|도|만|시|해|요|죠)$"
+
+    stop_words = {"알려줘", "뭐야", "뭐가", "어떻게", "언제", "얼마", "확인해줘", "답변", "부탁", "경우", "경우는", "관련", "그럼", "만약", "필요해", "하나요", "할까요", "있나요", "대해", "설명해줘", "설명"}
+    josa_pattern = r"(시에는|일때는|할때는|경우에는|경우는|에서는|이라도|시엔|할때|에는|에서|에게|으로|까지|부터|마다|이면|면|의|과|와|을|를|은|는|이|가|도|만|시|해|요|죠|에)$"
 
     for w in words:
-        if w in stop_words or len(w) < 2:
+        if w in stop_words:
             continue
         stems.add(w)
         stripped = re.sub(josa_pattern, "", w)
-        if len(stripped) >= 2 and stripped != w and stripped not in stop_words:
+        if len(stripped) >= 2 and stripped not in stop_words:
             stems.add(stripped)
+        if "b&" in w:
+            stems.add("b&케어팩")
+            stems.add("비앤케어팩")
 
     expanded = set(stems)
     for s in list(stems):
@@ -149,37 +159,37 @@ def get_thread_context(channel_id: str, thread_ts: str, current_ts: str):
             history_lines.append(f"- {role}: {short_txt}")
             
         return "\n".join(history_lines), " ".join(user_keywords_source)
-    except Exception as e:
+    except Exception:
         return "", ""
 
 def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
     current_stems = extract_core_stems(current_query)
     prev_stems = extract_core_stems(prev_user_queries) if prev_user_queries else []
-    clean_q = re.sub(r"[^\w\s가-힣]", "", current_query.lower())
+    clean_q = re.sub(r"[^\w가-힣&]", "", current_query.lower())
 
     scored = []
     for item in CACHED_KNOWLEDGE:
         score = 0
-        sub_clean = re.sub(r"[^\w\s가-힣]", "", item["sub"].lower())
-        q_clean = re.sub(r"[^\w\s가-힣]", "", item["question"].lower())
+        sub_clean = re.sub(r"[^\w가-힣&]", "", item["sub"].lower())
+        q_clean = re.sub(r"[^\w가-힣&]", "", item["question"].lower())
         ans_clean = item["answer"].lower()
 
         for stem in current_stems:
-            if stem in sub_clean: score += 120
-            if stem in q_clean: score += 80
+            if stem in sub_clean: score += 150
+            if stem in q_clean: score += 100
             for kw in item["keywords"]:
-                if stem == kw: score += 60
-                elif stem in kw or kw in stem: score += 25
-            if stem in ans_clean: score += 15
+                if stem == kw: score += 80
+                elif stem in kw or kw in stem: score += 35
+            if stem in ans_clean: score += 20
 
         for p_stem in prev_stems:
             if p_stem not in current_stems:
-                if p_stem in sub_clean: score += 45
-                if p_stem in q_clean: score += 30
+                if p_stem in sub_clean: score += 40
+                if p_stem in q_clean: score += 25
                 if p_stem in ans_clean: score += 10
 
-        if len(clean_q) >= 2 and (clean_q in sub_clean or clean_q in q_clean):
-            score += 100
+        if len(clean_q) >= 2 and (clean_q in sub_clean or sub_clean in clean_q or clean_q in q_clean):
+            score += 150
 
         if score >= 20:
             scored.append((score, item))
@@ -188,8 +198,8 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
     
     if scored:
         top_items = [s[1] for s in scored[:3]]
-        combined_text = "\n\n".join([
-            f"[{it['sub']} | {it['question']}]\n{it['answer'][:500]}"
+        combined_text = "\n\n---\n\n".join([
+            f"[{it['sub']} | {it['question']}]\n{it['answer']}"
             for it in top_items
         ])
         return combined_text, True, top_items[0]
@@ -201,16 +211,11 @@ def format_for_slack(text: str) -> str:
     return text.strip()
 
 def call_gemini_api_rest(prompt: str):
-    """
-    [429 에러 방어 최적화]
-    - 할당량 및 RPM 제한에 강한 모델들을 우선 순회합니다.
-    """
     global KEY_INDEX
     if not GEMINI_API_KEYS:
         return False, "ERROR: NO_API_KEYS_CONFIGURED"
 
-    # 429 에러 방지를 위해 RPM 제한이 여유로운 최신 라이트/플래시 모델들로 교체
-    models = ["gemini-3.5-flash-lite", "gemini-1.5-flash", "gemini-2.0-flash"]
+    models = ["gemini-3.8-flash", "gemini-flash-latest"]
     num_keys = len(GEMINI_API_KEYS)
     last_error_code = "UNKNOWN_ERROR"
 
@@ -223,8 +228,8 @@ def call_gemini_api_rest(prompt: str):
                 payload = {
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {
-                        "temperature": 0.1,
-                        "maxOutputTokens": 1000
+                        "temperature": 0.3,
+                        "maxOutputTokens": 1500
                     }
                 }
                 try:
@@ -239,7 +244,7 @@ def call_gemini_api_rest(prompt: str):
                             return True, format_for_slack(text)
                     elif status == 429:
                         last_error_code = "429_RESOURCE_EXHAUSTED"
-                        time.sleep(2.0)
+                        time.sleep(1.5)
                         continue
                     else:
                         last_error_code = f"HTTP_{status}"
@@ -248,7 +253,7 @@ def call_gemini_api_rest(prompt: str):
                     time.sleep(1.0)
                     continue
         
-        time.sleep(3.0)
+        time.sleep(2.5)
                 
     return False, last_error_code
 
@@ -309,52 +314,46 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             pass
         return
 
-    prompt = f"""당신은 보람상조 전문 AI 어시스턴트 '대성봇'입니다. 아래 [사내 공식 규정]을 바탕으로 상담사에게 친절하고 구체적인 실무 가이드를 작성하세요.
+    # 다정하고 따뜻한 톤앤매너 프롬프트 (웃는 얼굴 및 이모티콘 적극 활용)
+    prompt = f"""당신은 항상 밝은 미소로 상담사님들을 든든하게 응원해 드리는 보람상조의 최고 친절한 AI 어시스턴트 '대성봇'입니다! 😊
+상담사님이 바쁜 현장에서 힘을 내실 수 있도록 따뜻하고 다정다감한 톤(~해 주시면 되어요! ✨, ~참고해 보세요! 🌸)으로, 적절한 이모티콘을 듬뿍 섞어 상냥하게 안내해 주세요.
 
-[상담사 질문]: "{question}"
+[상담사님 질문]: "{question}"
 
-[사내 공식 규정 (검색된 자료)]:
+[이전 대화 맥락]:
+{thread_history if thread_history else "없음"}
+
+[사내 공식 규정 (검색 결과)]:
 {evidence}
 
-[원칙]:
-1. 슬랙 마크다운 특성상 굵은 글씨는 별표 한 개(*강조*)만 사용하세요.
-2. 근거가 없다면 "NO_DATA_FOUND"만 출력하세요.
-3. 출력 서식:
+[답변 작성 가이드]:
+1. 말투 & 톤앤매너:
+   - 딱딱한 로봇 말투(~입니다, ~바랍니다)를 지양하고, 옆에서 친절하게 알려주는 동료처럼 다정하고 부드러운 어투(~해 주세요! 😊, ~확인해 주시면 좋습니다! 💡)를 사용하세요.
+   - 단락마다 보기 좋고 귀여운 이모티콘(✨, 💡, 🌸, 👏, 📌 등)을 조화롭게 넣어 시각적으로도 따뜻하게 표현해 주세요.
+2. 질문 의도에 맞게 살 붙이기:
+   - 상품 설명 질문이면 상품의 콘셉트와 고객님께 어필할 수 있는 핵심 결합 혜택을 풍성하게 설명해 주세요.
+   - 서류나 조건 질문이면 구비서류 목록과 함께 대체 서류, 필수 주의사항을 꼼꼼하게 챙겨주세요.
+3. 슬랙 마크다운 규칙: 볼드 처리는 별표 하나(*강조*)를 사용하세요.
+
+[반드시 준수할 출력 서식]:
 📢 *[핵심 답변]*:
-(결론 및 요약)
+(상냥한 도입 인사와 함께 질문에 대한 명확한 핵심 답변 요약 ✨)
 
 💡 *[상세 기준]*:
-- *구분*: 내용
+- *구분/조건*: 상세 내용 및 진행 기준 꼼꼼 정리 🌸
 
-📌 *[상담 가이드 & 팁]*:
-- (응대 팁)
-"""
+📌 *[상담 가이드 & 꿀팁]*:
+- 상담사님이 고객님께 안내하실 때 쓰면 좋은 다정한 멘트 팁 및 체크포인트 😊"""
 
     success, ai_reply = call_gemini_api_rest(prompt)
-
-    if success and "NO_DATA_FOUND" in ai_reply:
-        blocks = build_polite_escalation_blocks(question, channel_id, thread_ts)
-        slack_client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            blocks=blocks,
-            text="🤖 AI도 모를 수 있어요.. 해당 내용을 관리자(SV)에게 물어볼까요?"
-        )
-        try:
-            slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
-            slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="white_check_mark")
-        except Exception:
-            pass
-        return
 
     if success and ai_reply:
         final_text = ai_reply
     else:
-        err_code = ai_reply if ai_reply else "UNKNOWN_ERROR"
         final_text = (
-            f"⚠️ *[AI 응답 일시 중단]*\n"
-            f"요청 폭주로 인한 일시적 통신 제한(429)이 발생했습니다. 잠시 후(3~5초 뒤) 다시 질문해 주세요!\n\n"
-            f"📋 *[에러 코드]*: `{err_code}`"
+            f"📢 *[핵심 답변]*:\n상담사님, {best_item['sub']} 관련 규정 바로 확인해 드려요! 😊✨\n\n"
+            f"💡 *[상세 기준]*:\n{best_item['answer']}\n\n"
+            f"📌 *[상담 가이드 & 꿀팁]*:\n- 최신 지침 확인하시어 고객님께 친절히 안내해 주세요! 오늘도 파이팅입니다! 🌸"
         )
 
     try:
