@@ -8,14 +8,19 @@ from google.genai import types
 
 app = FastAPI()
 
-# 환경변수 로드
+# 1. 환경변수 로드 (3개 키 목록화)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+API_KEYS = [
+    os.environ.get("GEMINI_API_KEY_1"),
+    os.environ.get("GEMINI_API_KEY_2"),
+    os.environ.get("GEMINI_API_KEY_3"),
+]
+# 비어있지 않은 키만 필터링
+GEMINI_API_KEYS = [k for k in API_KEYS if k]
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 메모리 즉시 매칭용 마스터 지식 (0.001초 응답)
+# 2. 로컬 메모리 마스터 지식 (0.001초 검색)
 DEFAULT_KNOWLEDGE = [
     {
         "category": "구비서류",
@@ -62,18 +67,40 @@ def search_memory_knowledge(query: str) -> str:
     matched.sort(key=lambda x: x[0], reverse=True)
     return "\n\n---\n\n".join([m[1] for m in matched[:3]])
 
+def call_gemini_with_key_rotation(prompt: str) -> str:
+    """3개 키를 순차적으로 시도하여 한 키가 소진/오류여도 다음 키로 즉시 처리"""
+    models_to_try = ["gemini-2.5-flash", "gemini-flash-latest"]
+
+    for api_key in GEMINI_API_KEYS:
+        try:
+            client = genai.Client(api_key=api_key)
+            for model_name in models_to_try:
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(temperature=0.1)
+                    )
+                    if response and response.text:
+                        return response.text
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return "⚠️ 일시적인 지연이 발생했습니다. 잠시 후 다시 질문해 주세요."
+
 def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question: str):
-    """슬랙 3초 룰에 구애받지 않고 백그라운드에서 1~2초 내에 응답을 완료하는 함수"""
-    # 1. 눈 이모지 즉시 달기
+    # 1. 눈 이모지 즉시 등록
     try:
         slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="eyes")
     except Exception:
         pass
 
-    # 2. 로컬 메모리 지식 매칭 (0.001초 소요)
+    # 2. 로컬 메모리 지식 매칭
     evidence = search_memory_knowledge(question)
 
-    # 3. Gemini 2.5 Flash 호출 (1.0초 소요)
+    # 3. Gemini 2.5 Flash 호출 (3개 키 순환)
     prompt = f"""
 당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트입니다.
 사내 공식 규정을 바탕으로 신속하고 정확한 실무 답변을 작성하세요.
@@ -88,17 +115,9 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 💡 *[상세 기준]*: (상세 내역 및 프로세스)
 📌 *[상담 가이드 & 팁]*: (실무 유의사항)
 """
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1)
-        )
-        reply_text = response.text
-    except Exception as e:
-        reply_text = "⚠️ 일시적인 지연이 발생했습니다. 잠시 후 다시 질문해 주세요."
+    reply_text = call_gemini_with_key_rotation(prompt)
 
-    # 4. 스레드 답변 전송
+    # 4. 슬랙 스레드 답변 전송
     slack_client.chat_postMessage(
         channel=channel_id,
         thread_ts=thread_ts,
@@ -106,7 +125,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
         mrkdwn=True
     )
 
-    # 5. 눈 이모지 제거 및 체크 이모지 등록
+    # 5. 이모지 교체 (eyes 제거 -> white_check_mark 등록)
     try:
         slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
     except Exception:
@@ -120,12 +139,11 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 async def handle_slack_events(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
 
-    # 슬랙 최초 URL 인증용 핸들러
+    # 슬랙 최초 URL 검증(Challenge)
     if data.get("type") == "url_verification":
         return {"challenge": data.get("challenge")}
 
     event = data.get("event", {})
-    # 봇 본인의 메시지나 시스템 수정 건 제외
     if event.get("type") == "message" and not event.get("bot_id") and not event.get("subtype"):
         text = event.get("text", "").strip()
         channel_id = event.get("channel")
@@ -134,7 +152,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
         if text.startswith("[질의-AI]"):
             question = text.replace("[질의-AI]", "").strip()
-            # 0.01초 만에 백그라운드로 넘겨 슬랙 3초 타임아웃 원천 방지
+            # 0.05초 만에 백그라운드 위임
             background_tasks.add_task(
                 async_bot_worker,
                 channel_id,
@@ -143,5 +161,4 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                 question
             )
 
-    # 슬랙에는 0.05초 만에 200 OK를 던져 연결을 즉시 마무리
     return {"status": "ok"}
