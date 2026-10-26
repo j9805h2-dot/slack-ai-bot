@@ -70,7 +70,6 @@ sync_master_knowledge()
 
 def search_memory_knowledge(query: str):
     clean_q = re.sub(r"[^\w\s가-힣]", " ", query.lower())
-    # 불용어를 제거하여 불필요한 행 매칭 차단
     stop_words = {"서류", "필요", "뭐야", "알려줘", "관련", "대해", "어떻게", "확인", "부탁", "필요한", "서류가"}
     tokens = [t for t in clean_q.split() if len(t) > 1 and t not in stop_words]
 
@@ -100,31 +99,33 @@ def search_memory_knowledge(query: str):
     return "\n\n---\n\n".join(matched_items), len(matched_items) > 0
 
 def call_gemini_api(prompt: str):
-    """(성공여부, 텍스트_또는_에러메시지) 튜플 반환"""
-    models = ["gemini-2.5-flash"]
+    models = [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-lite",
+        "gemini-flash-latest"
+    ]
     last_err = "등록된 GEMINI_API_KEY가 없습니다."
 
-    for api_key in GEMINI_API_KEYS:
-        try:
-            client = genai.Client(api_key=api_key)
-            for model_name in models:
-                try:
-                    res = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.1,
-                            max_output_tokens=2048
-                        )
+    for model_name in models:
+        for api_key in GEMINI_API_KEYS:
+            try:
+                client = genai.Client(api_key=api_key)
+                res = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=2048
                     )
-                    if res and res.text:
-                        return True, res.text.strip()
-                except Exception as inner_e:
-                    last_err = f"[{model_name}] {str(inner_e)}"
-                    continue
-        except Exception as outer_e:
-            last_err = f"[Client Init] {str(outer_e)}"
-            continue
+                )
+                if res and res.text:
+                    return True, res.text.strip()
+            except Exception as e:
+                err_str = str(e)
+                last_err = f"[{model_name}] {err_str}"
+                if "404" in err_str:
+                    break
+                continue
 
     return False, last_err
 
@@ -163,27 +164,33 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
     evidence, has_match = search_memory_knowledge(question)
 
-    prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트입니다.
-반드시 아래 [사내 공식 규정]에 적힌 내용을 바탕으로 상담사가 바로 읽고 고객에게 안내할 수 있도록 정갈하고 명확하게 가공 및 정제하여 답변을 작성하세요.
-절대로 원본 데이터를 그대로 덤프하거나 복사-붙여넣기 하듯 투박하게 출력하지 마세요.
+    # 기존 Apps Script 전문 프롬프트 복원
+    prompt = f"""당신은 고객센터 상담사를 실시간으로 코칭하는 전문 수석 CS 어시스턴트입니다.
+상담사가 고객과 통화/상담 중 즉시 핵심을 확인하고 전달할 수 있도록 정확하고 깔끔하게 안내하세요.
 
-[상담사 질문]: {question}
+[원칙 1] 제공된 [사내 공식 규정]에 적힌 팩트만을 바탕으로 작성하세요. 규정에 없는 내용을 임의로 추측하거나 지어내지 마세요.
+[원칙 2] 절대로 원본 지식 텍스트를 복사-붙여넣기 하듯 날것으로 출력하지 말고, 상담에 최적화된 문장과 번호 목록으로 완벽하게 재구성(정제)하세요.
+[원칙 3] 반드시 아래 출력 서식을 엄격히 준수하세요.
+
+[상담사 질문]:
+{question}
 
 [사내 공식 규정]:
-{evidence if has_match else "사내 규정에 명시되어 있지 않음"}
+{evidence if has_match else "사내 공식 지식에 미등록된 항목입니다."}
 
 [반드시 준수할 출력 서식]:
 📢 *[핵심 답변]*:
-(결론 및 필수 구비서류 목록을 가독성 좋은 번호나 글머리 기호로 정돈)
+(결론 및 필수 구비서류 목록을 보기 편하게 번호/강조 기호로 명확히 작성)
 
 💡 *[상세 기준]*:
-- **진행 프로세스**: 서류 접수 및 업무 처리 절차
-- **대체 가능 서류 및 유의사항**: 세부 조건
+- **진행 조건/주기**: 세부 기준 및 적용 시점
+- **프로세스**: 단계별 전산 처리 절차
+- **유의/예외 사항**: 필수 체크 항목 및 대체 서류 규정
 
 📌 *[상담 가이드 & 팁]*:
-- 상담 시 필수 확인 사항 및 실무 팁
+- 고객 안내 시 주의할 점 및 실제 안내 스크립트 조언
 
-(※ 규정이 없는 경우 '사내 공식 지식에 미등록된 항목이므로 SV 확인이 필요합니다.' 명시)"""
+(※ 만약 [사내 공식 규정]에 관련 내용이 없다면 일체의 허위 사실을 적지 말고 '사내 공식 지식에 미등록된 항목이므로 SV(관리자) 확인이 필요합니다.'라고 명시할 것)"""
 
     success, result_text = call_gemini_api(prompt)
 
