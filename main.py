@@ -8,7 +8,7 @@ from slack_sdk import WebClient
 
 app = FastAPI()
 
-# 1. 환경변수 (다중 키 및 단일 키 모두 자동 인식)
+# 1. 환경변수 로드
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
 raw_keys = [
@@ -21,7 +21,7 @@ GEMINI_API_KEYS = list(dict.fromkeys([k.strip() for k in raw_keys if k and k.str
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# 2. 마스터 지식 시트 캐싱 (1,347건 초고속 로드)
+# 2. 마스터 지식 시트 캐싱 (1,347건)
 MASTER_SHEET_ID = "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4"
 CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=%F0%9F%93%9AAI_%EB%A7%88%EC%8A%A4%ED%84%B0%EC%A7%80%EC%8B%9D"
 
@@ -30,7 +30,7 @@ CACHED_KNOWLEDGE = []
 def sync_master_knowledge():
     global CACHED_KNOWLEDGE
     try:
-        res = requests.get(CSV_EXPORT_URL, timeout=15)
+        res = requests.get(CSV_EXPORT_URL, timeout=10)
         if res.status_code == 200:
             f = io.StringIO(res.text)
             reader = csv.reader(f)
@@ -66,7 +66,8 @@ def sync_master_knowledge():
 
 sync_master_knowledge()
 
-def search_memory_knowledge(query: str) -> str:
+def search_memory_knowledge(query: str):
+    """관련 규정 1~3건 및 매칭 여부 반환"""
     clean_q = re.sub(r"[^\w\s가-힣]", " ", query.lower())
     tokens = [t for t in clean_q.split() if len(t) > 1]
 
@@ -84,13 +85,15 @@ def search_memory_knowledge(query: str) -> str:
             scored.append((score, f"[{item['category']} > {item['sub']} - {item['question']}]\n{item['answer']}"))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return "\n\n---\n\n".join([item[1] for item in scored[:3]])
+    matched_text = "\n\n---\n\n".join([item[1] for item in scored[:3]])
+    return matched_text
 
 def call_gemini_direct_rest(prompt: str) -> str:
+    # 가장 빠르고 안정적인 모델 순서로 호출
     models = [
-        "gemini-2.0-flash",
         "gemini-2.5-flash",
-        "gemini-flash-latest"
+        "gemini-1.5-flash",
+        "gemini-2.0-flash"
     ]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -100,33 +103,26 @@ def call_gemini_direct_rest(prompt: str) -> str:
         }
     }
 
-    last_err = ""
     for model in models:
         for key in GEMINI_API_KEYS:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
             try:
-                # 넉넉하게 30초 타임아웃 적용
+                # 8초 내에 안 오면 다른 모델/키로 즉시 전환
                 res = requests.post(
                     url,
                     headers={"Content-Type": "application/json"},
                     json=payload,
-                    timeout=30
+                    timeout=8
                 )
                 if res.status_code == 200:
                     data = res.json()
                     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                     if parts and "text" in parts[0]:
                         return parts[0]["text"]
-                elif res.status_code == 503:
-                    last_err = f"503 과부하({model})"
-                    continue
-                else:
-                    last_err = f"API 오류 {res.status_code}: {res.text[:100]}"
-            except Exception as e:
-                last_err = f"호출 예외: {str(e)}"
+            except Exception:
                 continue
 
-    return f"⚠️ 지식 조회 오류: {last_err}"
+    return ""
 
 def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question: str):
     # 1. 눈 이모지 등록
@@ -135,10 +131,10 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     except Exception:
         pass
 
-    # 2. 1,347건 메모리에서 초고속 규정 검색
+    # 2. 마스터 지식 검색
     evidence = search_memory_knowledge(question)
 
-    # 3. Gemini REST 호출 (최대 30초 대기)
+    # 3. Gemini 호출
     prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트입니다.
 반드시 아래 [사내 공식 규정]에 명시된 내용만을 기반으로 신속 정확하게 답변을 작성하세요.
 
@@ -149,13 +145,21 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
 [답변 가이드]:
 📢 *[핵심 답변]*: (결론 및 필수 구비서류)
-💡 *[상세 기준]*: (상세 내역 및 진행 프로세스)
+💡 *[상세 기준]*: (상세 내역 및 프로세스)
 📌 *[상담 가이드 & 팁]*: (실무 유의사항)
 (※ 규정에 없는 내용일 경우 '사내 공식 지식에 미등록된 항목이므로 SV 확인이 필요합니다' 명시)"""
 
-    reply_text = call_gemini_direct_rest(prompt)
+    ai_reply = call_gemini_direct_rest(prompt)
 
-    # 4. 슬랙 스레드 답변 전송
+    # 4. AI 응답 실패 시 마스터 시트 원본 규정 직출력 (타임아웃 에러 차단)
+    if ai_reply and ai_reply.strip():
+        reply_text = ai_reply
+    elif evidence:
+        reply_text = f"📢 *[사내 마스터 지식 규정 즉시 조회]*\n\n{evidence}\n\n📌 *(AI 요약 지연으로 사내 공식 시트 원문을 직접 안내드립니다)*"
+    else:
+        reply_text = "⚠️ 사내 공식 지식 베이스에 등록되지 않은 질의입니다. SV/관리자 확인이 필요합니다."
+
+    # 5. 슬랙 스레드 전송
     try:
         slack_client.chat_postMessage(
             channel=channel_id,
@@ -166,7 +170,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     except Exception as e:
         print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 5. 이모지 교체 (eyes -> white_check_mark)
+    # 6. 이모지 교체
     try:
         slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
     except Exception:
