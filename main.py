@@ -100,16 +100,13 @@ def search_memory_knowledge(query: str):
     return "\n\n---\n\n".join(matched_items), len(matched_items) > 0
 
 def call_gemini_api(prompt: str):
-    """
-    타임아웃을 25초로 넉넉하게 설정하여 Read timed out 방지
-    """
     if not GEMINI_API_KEYS:
         return False, "Render 환경변수에 GEMINI_API_KEY가 등록되어 있지 않습니다."
 
     models = ["gemini-3.8-flash", "gemini-flash-latest"]
     error_logs = []
 
-    # 1. Google GenAI SDK 방식 (권장 방식)
+    # 1. Google GenAI SDK 호출
     for idx, api_key in enumerate(GEMINI_API_KEYS):
         key_alias = f"Key_{idx+1}(..{api_key[-4:]})"
         try:
@@ -121,7 +118,7 @@ def call_gemini_api(prompt: str):
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             temperature=0.1,
-                            max_output_tokens=2048
+                            max_output_tokens=1500
                         )
                     )
                     if res and res.text:
@@ -134,10 +131,10 @@ def call_gemini_api(prompt: str):
         except Exception as init_err:
             error_logs.append(f"[ClientInit-{key_alias}] {str(init_err)[:100]}")
 
-    # 2. REST API 폴백 (timeout 25초로 상향)
+    # 2. REST API 폴백
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1500}
     }
     for idx, api_key in enumerate(GEMINI_API_KEYS):
         key_alias = f"Key_{idx+1}(..{api_key[-4:]})"
@@ -192,18 +189,34 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
     evidence, has_match = search_memory_knowledge(question)
 
-    prompt = f"""당신은 고객센터 상담사를 실시간으로 코칭하는 전문 CS 어시스턴트입니다.
-상담사가 고객과 통화/상담 중 즉시 핵심을 확인하고 전달할 수 있도록 정확하고 깔끔하게 안내하세요.
+    # 1. 사내 지식에 없는 경우: AI 호출 자체를 생략하여 토큰 및 429 낭비 방지
+    if not has_match:
+        final_text = (
+            "📢 *[핵심 답변]*:\n"
+            "사내 마스터 지식에 등록되지 않은 항목입니다.\n\n"
+            "📌 *[상담 가이드 & 팁]*:\n"
+            "- 임의로 안내하지 마시고, 아래 *[🚨 관리자(SV) 확인 요청]* 버튼을 눌러 확인 후 진행해 주세요."
+        )
+        blocks = build_escalation_blocks(final_text, channel_id, thread_ts, question)
+        try:
+            slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, blocks=blocks, text=final_text)
+        except Exception as e:
+            print(f"❌ 슬랙 전송 실패: {e}")
+        try:
+            slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
+            slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="white_check_mark")
+        except Exception:
+            pass
+        return
 
-[원칙 1] 제공된 [사내 공식 규정]에 적힌 팩트만을 바탕으로 작성하세요. 규정에 없는 내용을 임의로 추측하거나 지어내지 마세요.
-[원칙 2] 절대로 원본 지식 텍스트를 복사-붙여넣기 하듯 날것으로 출력하지 말고, 상담에 최적화된 문장과 번호 목록으로 완벽하게 재구성(정제)하세요.
-[원칙 3] 반드시 아래 출력 서식을 엄격히 준수하세요.
+    # 2. 사내 지식 매칭 시: 오직 사내 지식만을 기반으로 3단 서식 정제 수행 (날씨/일반상식 프롬프트 일절 배제)
+    prompt = f"""당신은 고객센터 상담사를 실시간 코칭하는 CS 전문 어시스턴트입니다.
+반드시 아래 [사내 공식 규정]에 적힌 사실만을 기반으로, 상담사가 고객에게 바로 읽어줄 수 있도록 깔끔하게 가공 및 정제하여 답변하세요.
 
-[상담사 질문]:
-{question}
+[상담사 질문]: {question}
 
 [사내 공식 규정]:
-{evidence if has_match else "사내 공식 지식에 미등록된 항목입니다."}
+{evidence}
 
 [반드시 준수할 출력 서식]:
 📢 *[핵심 답변]*:
@@ -215,9 +228,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 - **유의/예외 사항**: 필수 체크 항목 및 대체 서류 규정
 
 📌 *[상담 가이드 & 팁]*:
-- 고객 안내 시 주의할 점 및 실제 안내 스크립트 조언
-
-(※ 만약 [사내 공식 규정]에 관련 내용이 없다면 일체의 허위 사실을 적지 말고 '사내 공식 지식에 미등록된 항목이므로 SV(관리자) 확인이 필요합니다.'라고 명시할 것)"""
+- 고객 안내 시 주의할 점 및 실제 안내 스크립트 조언"""
 
     try:
         success, result_text = call_gemini_api(prompt)
@@ -226,17 +237,17 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
         result_text = f"[치명적 오류]: {str(fatal_e)}"
 
     need_button = False
-    if is_direct_escalate or is_correction or not has_match or not success:
+    if is_direct_escalate or is_correction or not success:
         need_button = True
 
     if success:
         final_text = result_text
     else:
+        # API 쿼터 초과 시 시트 내용 우선 출력
         final_text = (
-            f"🚨 *[Gemini API 호출 에러 리포트]*\n"
-            f"```{result_text}```\n\n"
-            f"📢 *[임시 사내 마스터 규정 조회 결과]*:\n"
-            f"{evidence if has_match else '사내 지식 베이스에 관련 규정이 등록되어 있지 않습니다.'}"
+            f"📢 *[핵심 답변]*:\n사내 마스터 규정 조회 결과입니다.\n\n"
+            f"{evidence}\n\n"
+            f"📌 *[상담 가이드 & 팁]*:\n- 최신 업무 지침 원문을 확인하여 상담을 진행해 주세요."
         )
 
     try:
