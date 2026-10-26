@@ -70,6 +70,7 @@ sync_master_knowledge()
 
 def search_memory_knowledge(query: str):
     clean_q = re.sub(r"[^\w\s가-힣]", " ", query.lower())
+    # 불용어를 제거하여 불필요한 행 매칭 차단
     stop_words = {"서류", "필요", "뭐야", "알려줘", "관련", "대해", "어떻게", "확인", "부탁", "필요한", "서류가"}
     tokens = [t for t in clean_q.split() if len(t) > 1 and t not in stop_words]
 
@@ -100,7 +101,7 @@ def search_memory_knowledge(query: str):
 
 def call_gemini_api(prompt: str):
     """(성공여부, 텍스트_또는_에러메시지) 튜플 반환"""
-    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+    models = ["gemini-2.5-flash"]
     last_err = "등록된 GEMINI_API_KEY가 없습니다."
 
     for api_key in GEMINI_API_KEYS:
@@ -190,7 +191,6 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     if is_direct_escalate or is_correction or not has_match or not success:
         need_button = True
 
-    # 성공 시 정제 답변 출력, 실패 시 실제 원인 에러를 스레드에 그대로 출력
     if success:
         final_text = result_text
     else:
@@ -232,6 +232,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
     body_bytes = await request.body()
     body_str = body_bytes.decode("utf-8")
 
+    # 1. 관리자 인계 버튼 클릭 및 모달 팝업 상호작용
     if body_str.startswith("payload="):
         parsed = urllib.parse.parse_qs(body_str)
         raw_payload = parsed.get("payload", ["{}"])[0]
@@ -323,6 +324,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
             return {"response_action": "clear"}
 
+    # 2. 일반 슬랙 메시지 이벤트
     try:
         data = json.loads(body_str)
     except Exception:
