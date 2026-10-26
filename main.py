@@ -85,8 +85,12 @@ def search_memory_knowledge(query: str) -> str:
     return "\n\n---\n\n".join([item[1] for item in scored[:3]])
 
 def call_gemini_direct_rest(prompt: str) -> str:
-    """REST API 직접 호출 (SDK 종속성/동결 현상 원천 차단)"""
-    models = ["gemini-2.5-flash", "gemini-flash-latest"]
+    # 503 트래픽 과부하를 회피하기 위해 다중 모델 순환 설정
+    models = [
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-flash-latest"
+    ]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -96,8 +100,8 @@ def call_gemini_direct_rest(prompt: str) -> str:
     }
 
     last_err = ""
-    for key in GEMINI_API_KEYS:
-        for model in models:
+    for model in models:
+        for key in GEMINI_API_KEYS:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
             try:
                 res = requests.post(
@@ -111,6 +115,10 @@ def call_gemini_direct_rest(prompt: str) -> str:
                     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                     if parts and "text" in parts[0]:
                         return parts[0]["text"]
+                elif res.status_code == 503:
+                    # 구글 일시 과부하 시 다음 모델로 즉시 건너뜀
+                    last_err = f"503 모델 과부하({model})"
+                    continue
                 else:
                     last_err = f"API 오류 {res.status_code}: {res.text[:100]}"
             except Exception as e:
@@ -126,7 +134,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     except Exception:
         pass
 
-    # 2. 마스터 지식 1,347건 중 관련 규정 검색
+    # 2. 1,347건 마스터 지식 검색
     evidence = search_memory_knowledge(question)
 
     # 3. Gemini 프롬프트 구성 및 REST 호출
@@ -144,7 +152,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 📌 *[상담 가이드 & 팁]*: (실무 유의사항)
 (※ 규정에 없는 내용일 경우 '사내 공식 지식에 미등록된 항목이므로 SV 확인이 필요합니다' 명시)"""
 
-    reply_text = call_gemini_direct_rest(prompt)
+    reply_text = call_gemini_api_direct_rest(prompt)
 
     # 4. 스레드 전송
     try:
@@ -157,7 +165,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     except Exception as e:
         print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 5. 이모지 교체 (eyes -> white_check_mark)
+    # 5. 이모지 교체
     try:
         slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
     except Exception:
