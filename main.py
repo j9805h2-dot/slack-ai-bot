@@ -4,7 +4,6 @@ import csv
 import io
 import json
 import urllib.parse
-import traceback
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
@@ -92,23 +91,63 @@ def search_memory_knowledge(query: str):
                     score += 10
 
         if score >= 30:
-            content = f"[{item['category']} > {item['sub']} - {item['question']}]\n{item['answer']}"
-            scored.append((score, content))
+            scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    matched_items = [s[1] for s in scored[:2]]
-    return "\n\n---\n\n".join(matched_items), len(matched_items) > 0
+    best_item = scored[0][1] if scored else None
+    return best_item
+
+def format_clean_template(item: dict) -> str:
+    """Gemini 호출 실패(429 쿼터 등) 시에도 날것 덤프를 원천 차단하고 100% 3단 서식으로 강제 정제"""
+    sub = item.get("sub", "")
+    ans = item.get("answer", "")
+
+    # 줄 단위 파싱
+    lines = [line.strip() for line in ans.split("\n") if line.strip()]
+    req_docs = []
+    process_steps = []
+    notes = []
+
+    current_mode = "none"
+    for line in lines:
+        if "필수 구비서류" in line or "구비서류:" in line:
+            current_mode = "docs"
+            continue
+        elif "진행 프로세스" in line or "프로세스:" in line:
+            current_mode = "proc"
+            process_steps.append(line.replace("- 진행 프로세스:", "").strip())
+            continue
+        elif "비고사항" in line or "유의사항" in line:
+            current_mode = "note"
+            continue
+
+        if current_mode == "docs":
+            if line.startswith("-") or re.match(r"^\d+\.", line):
+                req_docs.append(line)
+            elif "대체서류" in line:
+                notes.append(line)
+        elif current_mode == "proc":
+            process_steps.append(line)
+        elif current_mode == "note":
+            notes.append(line)
+
+    # 1. 핵심 답변 블록
+    docs_text = "\n".join(req_docs) if req_docs else ans[:150]
+    core_text = f"📢 *[핵심 답변]*:\n{sub} 업무 처리 시 필수 확인 서류 및 기준입니다.\n{docs_text}"
+
+    # 2. 상세 기준 블록
+    proc_text = "\n".join([f"- **진행 절차**: {p}" for p in process_steps]) if process_steps else "- **진행 절차**: 구비서류 확인 후 전산 변경 처리"
+    detail_text = f"💡 *[상세 기준]*:\n{proc_text}"
+
+    # 3. 상담 가이드 & 팁 블록
+    note_text = "\n".join([f"- {n}" for n in notes]) if notes else "- 변경 전/후 고객 기본 정보(성명, 주민등록번호 등) 일치 여부를 반드시 확인하세요."
+    tip_text = f"📌 *[상담 가이드 & 팁]*:\n{note_text}"
+
+    return f"{core_text}\n\n{detail_text}\n\n{tip_text}"
 
 def call_gemini_api(prompt: str):
-    if not GEMINI_API_KEYS:
-        return False, "Render 환경변수에 GEMINI_API_KEY가 등록되어 있지 않습니다."
-
     models = ["gemini-3.8-flash", "gemini-flash-latest"]
-    error_logs = []
-
-    # 1. Google GenAI SDK 호출
-    for idx, api_key in enumerate(GEMINI_API_KEYS):
-        key_alias = f"Key_{idx+1}(..{api_key[-4:]})"
+    for api_key in GEMINI_API_KEYS:
         try:
             client = genai.Client(api_key=api_key)
             for m in models:
@@ -116,43 +155,15 @@ def call_gemini_api(prompt: str):
                     res = client.models.generate_content(
                         model=m,
                         contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.1,
-                            max_output_tokens=1500
-                        )
+                        config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=1500)
                     )
                     if res and res.text:
                         return True, res.text.strip()
-                except Exception as sdk_err:
-                    err_msg = str(sdk_err)
-                    error_logs.append(f"[{m}-{key_alias}] {err_msg[:120]}")
-                    if "404" in err_msg:
-                        break
-        except Exception as init_err:
-            error_logs.append(f"[ClientInit-{key_alias}] {str(init_err)[:100]}")
-
-    # 2. REST API 폴백
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1500}
-    }
-    for idx, api_key in enumerate(GEMINI_API_KEYS):
-        key_alias = f"Key_{idx+1}(..{api_key[-4:]})"
-        for m in models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
-            try:
-                res = requests.post(url, json=payload, timeout=25)
-                if res.status_code == 200:
-                    data = res.json()
-                    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    if parts and "text" in parts[0]:
-                        return True, parts[0]["text"].strip()
-                else:
-                    error_logs.append(f"[REST-{m}-{key_alias}] HTTP {res.status_code}: {res.text[:120]}")
-            except Exception as rest_err:
-                error_logs.append(f"[REST-{m}-{key_alias}] {str(rest_err)[:100]}")
-
-    return False, "\n".join(error_logs[-3:])
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False, ""
 
 def build_escalation_blocks(reply_text: str, channel_id: str, thread_ts: str, question: str):
     meta_val = json.dumps({"c": channel_id, "t": thread_ts, "q": question[:80]}, ensure_ascii=False)
@@ -187,10 +198,9 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     correction_keywords = ["틀렸", "달라", "아닌", "다시", "확인해", "오답", "이상해"]
     is_correction = any(k in question.lower() for k in correction_keywords)
 
-    evidence, has_match = search_memory_knowledge(question)
+    best_item = search_memory_knowledge(question)
 
-    # 1. 사내 지식에 없는 경우: AI 호출 자체를 생략하여 토큰 및 429 낭비 방지
-    if not has_match:
+    if not best_item:
         final_text = (
             "📢 *[핵심 답변]*:\n"
             "사내 마스터 지식에 등록되지 않은 항목입니다.\n\n"
@@ -200,23 +210,22 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
         blocks = build_escalation_blocks(final_text, channel_id, thread_ts, question)
         try:
             slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, blocks=blocks, text=final_text)
-        except Exception as e:
-            print(f"❌ 슬랙 전송 실패: {e}")
-        try:
             slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
             slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="white_check_mark")
         except Exception:
             pass
         return
 
-    # 2. 사내 지식 매칭 시: 오직 사내 지식만을 기반으로 3단 서식 정제 수행 (날씨/일반상식 프롬프트 일절 배제)
+    evidence_text = f"[{best_item['category']} > {best_item['sub']} - {best_item['question']}]\n{best_item['answer']}"
+
     prompt = f"""당신은 고객센터 상담사를 실시간 코칭하는 CS 전문 어시스턴트입니다.
-반드시 아래 [사내 공식 규정]에 적힌 사실만을 기반으로, 상담사가 고객에게 바로 읽어줄 수 있도록 깔끔하게 가공 및 정제하여 답변하세요.
+반드시 아래 [사내 공식 규정]에 적힌 내용만을 기반으로, 상담사가 고객에게 바로 읽어줄 수 있도록 정갈하고 명확하게 정제하여 작성하세요.
+날것의 원본 데이터를 복사-붙여넣기 하듯 출력하지 마세요.
 
 [상담사 질문]: {question}
 
 [사내 공식 규정]:
-{evidence}
+{evidence_text}
 
 [반드시 준수할 출력 서식]:
 📢 *[핵심 답변]*:
@@ -230,25 +239,15 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 📌 *[상담 가이드 & 팁]*:
 - 고객 안내 시 주의할 점 및 실제 안내 스크립트 조언"""
 
-    try:
-        success, result_text = call_gemini_api(prompt)
-    except Exception as fatal_e:
-        success = False
-        result_text = f"[치명적 오류]: {str(fatal_e)}"
+    success, ai_reply = call_gemini_api(prompt)
 
-    need_button = False
-    if is_direct_escalate or is_correction or not success:
-        need_button = True
-
-    if success:
-        final_text = result_text
+    # Gemini 성공 시 AI 정제본 출력, 실패 시(429 등) 파이썬 내부 템플릿 정제본 출력
+    if success and ai_reply:
+        final_text = ai_reply
     else:
-        # API 쿼터 초과 시 시트 내용 우선 출력
-        final_text = (
-            f"📢 *[핵심 답변]*:\n사내 마스터 규정 조회 결과입니다.\n\n"
-            f"{evidence}\n\n"
-            f"📌 *[상담 가이드 & 팁]*:\n- 최신 업무 지침 원문을 확인하여 상담을 진행해 주세요."
-        )
+        final_text = format_clean_template(best_item)
+
+    need_button = is_direct_escalate or is_correction
 
     try:
         if need_button:
@@ -270,11 +269,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
 @app.get("/")
 def health_check():
-    return {
-        "status": "ok",
-        "loaded_knowledge_count": len(CACHED_KNOWLEDGE),
-        "api_keys_loaded": len(GEMINI_API_KEYS)
-    }
+    return {"status": "ok", "loaded_knowledge_count": len(CACHED_KNOWLEDGE)}
 
 @app.get("/sync")
 def manual_sync():
@@ -286,7 +281,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
     body_bytes = await request.body()
     body_str = body_bytes.decode("utf-8")
 
-    # 1. 관리자 인계 버튼 클릭 및 모달 상호작용
+    # 1. 모달 팝업 상호작용
     if body_str.startswith("payload="):
         parsed = urllib.parse.parse_qs(body_str)
         raw_payload = parsed.get("payload", ["{}"])[0]
