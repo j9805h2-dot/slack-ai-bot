@@ -4,9 +4,12 @@ import csv
 import io
 import json
 import urllib.parse
+import traceback
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
@@ -97,50 +100,62 @@ def search_memory_knowledge(query: str):
     return "\n\n---\n\n".join(matched_items), len(matched_items) > 0
 
 def call_gemini_api(prompt: str):
-    """Interactions API 및 REST 엔드포인트 직접 호출"""
-    payload_interactions = {
-        "model": "gemini-3.8-flash",
-        "input": prompt
-    }
-    payload_v1beta = {
+    """
+    타임아웃을 25초로 넉넉하게 설정하여 Read timed out 방지
+    """
+    if not GEMINI_API_KEYS:
+        return False, "Render 환경변수에 GEMINI_API_KEY가 등록되어 있지 않습니다."
+
+    models = ["gemini-3.8-flash", "gemini-flash-latest"]
+    error_logs = []
+
+    # 1. Google GenAI SDK 방식 (권장 방식)
+    for idx, api_key in enumerate(GEMINI_API_KEYS):
+        key_alias = f"Key_{idx+1}(..{api_key[-4:]})"
+        try:
+            client = genai.Client(api_key=api_key)
+            for m in models:
+                try:
+                    res = client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.1,
+                            max_output_tokens=2048
+                        )
+                    )
+                    if res and res.text:
+                        return True, res.text.strip()
+                except Exception as sdk_err:
+                    err_msg = str(sdk_err)
+                    error_logs.append(f"[{m}-{key_alias}] {err_msg[:120]}")
+                    if "404" in err_msg:
+                        break
+        except Exception as init_err:
+            error_logs.append(f"[ClientInit-{key_alias}] {str(init_err)[:100]}")
+
+    # 2. REST API 폴백 (timeout 25초로 상향)
+    payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
     }
-
-    last_err = ""
-    for api_key in GEMINI_API_KEYS:
-        # 1. 안내문에 명시된 신규 Interactions API 우선 호출
-        url_interactions = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={api_key}"
-        try:
-            res = requests.post(url_interactions, json=payload_interactions, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                outputs = data.get("outputs", [])
-                if outputs and "text" in outputs[0]:
-                    return True, outputs[0]["text"].strip()
-                elif "text" in data:
-                    return True, data["text"].strip()
-        except Exception as e:
-            last_err = f"[Interactions] {str(e)}"
-
-        # 2. 호환 generateContent 엔드포인트 폴백
-        models = ["gemini-3.8-flash", "gemini-flash-latest"]
+    for idx, api_key in enumerate(GEMINI_API_KEYS):
+        key_alias = f"Key_{idx+1}(..{api_key[-4:]})"
         for m in models:
-            url_gen = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
             try:
-                res = requests.post(url_gen, json=payload_v1beta, timeout=8)
+                res = requests.post(url, json=payload, timeout=25)
                 if res.status_code == 200:
                     data = res.json()
                     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                     if parts and "text" in parts[0]:
                         return True, parts[0]["text"].strip()
                 else:
-                    last_err = f"[{m}] {res.status_code}: {res.text[:120]}"
-            except Exception as e:
-                last_err = f"[{m}] {str(e)}"
-                continue
+                    error_logs.append(f"[REST-{m}-{key_alias}] HTTP {res.status_code}: {res.text[:120]}")
+            except Exception as rest_err:
+                error_logs.append(f"[REST-{m}-{key_alias}] {str(rest_err)[:100]}")
 
-    return False, last_err
+    return False, "\n".join(error_logs[-3:])
 
 def build_escalation_blocks(reply_text: str, channel_id: str, thread_ts: str, question: str):
     meta_val = json.dumps({"c": channel_id, "t": thread_ts, "q": question[:80]}, ensure_ascii=False)
@@ -204,7 +219,11 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
 (※ 만약 [사내 공식 규정]에 관련 내용이 없다면 일체의 허위 사실을 적지 말고 '사내 공식 지식에 미등록된 항목이므로 SV(관리자) 확인이 필요합니다.'라고 명시할 것)"""
 
-    success, result_text = call_gemini_api(prompt)
+    try:
+        success, result_text = call_gemini_api(prompt)
+    except Exception as fatal_e:
+        success = False
+        result_text = f"[치명적 오류]: {str(fatal_e)}"
 
     need_button = False
     if is_direct_escalate or is_correction or not has_match or not success:
@@ -214,9 +233,10 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
         final_text = result_text
     else:
         final_text = (
-            f"⚠️ *[Gemini API 호출 오류 발생]*\n"
-            f"• *에러 내용*: `{result_text}`\n\n"
-            f"📢 *[임시 사내 마스터 규정 조회]*:\n{evidence if has_match else '등록된 규정 없음'}"
+            f"🚨 *[Gemini API 호출 에러 리포트]*\n"
+            f"```{result_text}```\n\n"
+            f"📢 *[임시 사내 마스터 규정 조회 결과]*:\n"
+            f"{evidence if has_match else '사내 지식 베이스에 관련 규정이 등록되어 있지 않습니다.'}"
         )
 
     try:
@@ -239,7 +259,11 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "loaded_knowledge_count": len(CACHED_KNOWLEDGE)}
+    return {
+        "status": "ok",
+        "loaded_knowledge_count": len(CACHED_KNOWLEDGE),
+        "api_keys_loaded": len(GEMINI_API_KEYS)
+    }
 
 @app.get("/sync")
 def manual_sync():
@@ -251,7 +275,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
     body_bytes = await request.body()
     body_str = body_bytes.decode("utf-8")
 
-    # 1. 관리자 인계 버튼 클릭 및 모달 팝업 상호작용
+    # 1. 관리자 인계 버튼 클릭 및 모달 상호작용
     if body_str.startswith("payload="):
         parsed = urllib.parse.parse_qs(body_str)
         raw_payload = parsed.get("payload", ["{}"])[0]
@@ -265,7 +289,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
             meta_dict = json.loads(action_val)
             orig_q = meta_dict.get("q", "문의 내용 없음")
 
-            # 앱스크립트 정통 다단 모달 폼 복원
             modal_view = {
                 "type": "modal",
                 "callback_id": "submit_escalate_modal",
@@ -385,7 +408,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
             return {"response_action": "clear"}
 
-    # 2. 일반 슬랙 메시지 이벤트
+    # 2. 슬랙 이벤트
     try:
         data = json.loads(body_str)
     except Exception:
