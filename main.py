@@ -7,8 +7,6 @@ import urllib.parse
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
-from google import genai
-from google.genai import types
 
 app = FastAPI()
 
@@ -99,32 +97,47 @@ def search_memory_knowledge(query: str):
     return "\n\n---\n\n".join(matched_items), len(matched_items) > 0
 
 def call_gemini_api(prompt: str):
-    models = [
-        "gemini-3.8-flash",
-        "gemini-3.8-flash-lite",
-        "gemini-flash-latest"
-    ]
-    last_err = "등록된 GEMINI_API_KEY가 없습니다."
+    """Interactions API 및 REST 엔드포인트 직접 호출"""
+    payload_interactions = {
+        "model": "gemini-3.8-flash",
+        "input": prompt
+    }
+    payload_v1beta = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
+    }
 
-    for model_name in models:
-        for api_key in GEMINI_API_KEYS:
+    last_err = ""
+    for api_key in GEMINI_API_KEYS:
+        # 1. 안내문에 명시된 신규 Interactions API 우선 호출
+        url_interactions = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={api_key}"
+        try:
+            res = requests.post(url_interactions, json=payload_interactions, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                outputs = data.get("outputs", [])
+                if outputs and "text" in outputs[0]:
+                    return True, outputs[0]["text"].strip()
+                elif "text" in data:
+                    return True, data["text"].strip()
+        except Exception as e:
+            last_err = f"[Interactions] {str(e)}"
+
+        # 2. 호환 generateContent 엔드포인트 폴백
+        models = ["gemini-3.8-flash", "gemini-flash-latest"]
+        for m in models:
+            url_gen = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
             try:
-                client = genai.Client(api_key=api_key)
-                res = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=2048
-                    )
-                )
-                if res and res.text:
-                    return True, res.text.strip()
+                res = requests.post(url_gen, json=payload_v1beta, timeout=8)
+                if res.status_code == 200:
+                    data = res.json()
+                    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    if parts and "text" in parts[0]:
+                        return True, parts[0]["text"].strip()
+                else:
+                    last_err = f"[{m}] {res.status_code}: {res.text[:120]}"
             except Exception as e:
-                err_str = str(e)
-                last_err = f"[{model_name}] {err_str}"
-                if "404" in err_str:
-                    break
+                last_err = f"[{m}] {str(e)}"
                 continue
 
     return False, last_err
@@ -164,8 +177,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
     evidence, has_match = search_memory_knowledge(question)
 
-    # 기존 Apps Script 전문 프롬프트 복원
-    prompt = f"""당신은 고객센터 상담사를 실시간으로 코칭하는 전문 수석 CS 어시스턴트입니다.
+    prompt = f"""당신은 고객센터 상담사를 실시간으로 코칭하는 전문 CS 어시스턴트입니다.
 상담사가 고객과 통화/상담 중 즉시 핵심을 확인하고 전달할 수 있도록 정확하고 깔끔하게 안내하세요.
 
 [원칙 1] 제공된 [사내 공식 규정]에 적힌 팩트만을 바탕으로 작성하세요. 규정에 없는 내용을 임의로 추측하거나 지어내지 마세요.
@@ -253,28 +265,60 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
             meta_dict = json.loads(action_val)
             orig_q = meta_dict.get("q", "문의 내용 없음")
 
+            # 앱스크립트 정통 다단 모달 폼 복원
             modal_view = {
                 "type": "modal",
                 "callback_id": "submit_escalate_modal",
                 "private_metadata": action_val,
-                "title": {"type": "plain_text", "text": "관리자(SV) 인계 질의서"},
-                "submit": {"type": "plain_text", "text": "인계 요청 전송"},
-                "close": {"type": "plain_text", "text": "취소"},
+                "title": {"type": "plain_text", "text": "🚨 SV 업무 확인 요청서", "emoji": True},
+                "submit": {"type": "plain_text", "text": "요청서 제출", "emoji": True},
+                "close": {"type": "plain_text", "text": "취소", "emoji": True},
                 "blocks": [
                     {
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"📋 *상담사 질문 내용:*\n>{orig_q}"}
+                        "text": {"type": "mrkdwn", "text": f"📋 *상담사 원본 질문*\n>{orig_q}"}
                     },
                     {"type": "divider"},
                     {
                         "type": "input",
+                        "block_id": "escalate_type_block",
+                        "label": {"type": "plain_text", "text": "📌 인계 사유 유형", "emoji": True},
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "escalate_type_select",
+                            "placeholder": {"type": "plain_text", "text": "유형을 선택해주세요", "emoji": True},
+                            "options": [
+                                {
+                                    "text": {"type": "plain_text", "text": "1. 사내 지식 미등록 / 신규 규정 확인", "emoji": True},
+                                    "value": "지식_미등록"
+                                },
+                                {
+                                    "text": {"type": "plain_text", "text": "2. AI 답변 내용 오류 / 팩트 불일치", "emoji": True},
+                                    "value": "답변_오류"
+                                },
+                                {
+                                    "text": {"type": "plain_text", "text": "3. 예외 케이스 처리 및 특별 승인 요청", "emoji": True},
+                                    "value": "예외_승인"
+                                },
+                                {
+                                    "text": {"type": "plain_text", "text": "4. 기타 실무 지침 문의", "emoji": True},
+                                    "value": "기타_문의"
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "input",
                         "block_id": "reason_block",
-                        "label": {"type": "plain_text", "text": "인계 사유 및 추가 문의 사항"},
+                        "label": {"type": "plain_text", "text": "📝 상세 확인 요청 내용", "emoji": True},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "reason_input",
                             "multiline": True,
-                            "placeholder": {"type": "plain_text", "text": "예: 지식 시트 기준과 다름 / 예외 케이스 처리 방법 확인 필요 등"}
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "관리자가 파악해야 할 상세 사유나 고객의 구체적인 상황을 입력해주세요."
+                            }
                         }
                     }
                 ]
@@ -295,18 +339,21 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
             channel_id = meta.get("c")
             thread_ts = meta.get("t")
             orig_q = meta.get("q", "")
-            reason = payload.get("view", {}).get("state", {}).get("values", {}).get("reason_block", {}).get("reason_input", {}).get("value", "")
+
+            values = payload.get("view", {}).get("state", {}).get("values", {})
+            sel_type = values.get("escalate_type_block", {}).get("escalate_type_select", {}).get("selected_option", {}).get("text", {}).get("text", "일반 인계")
+            reason = values.get("reason_block", {}).get("reason_input", {}).get("value", "내용 없음")
 
             notice_blocks = [
                 {
                     "type": "header",
-                    "text": {"type": "plain_text", "text": "🚨 [관리자(SV) 업무 확인 요청]", "emoji": True}
+                    "text": {"type": "plain_text", "text": "🚨 [관리자(SV) 업무 인계 접수]", "emoji": True}
                 },
                 {
                     "type": "section",
                     "fields": [
                         {"type": "mrkdwn", "text": f"*요청 상담사:*\n<@{user_id}> ({user_name})"},
-                        {"type": "mrkdwn", "text": f"*상태:*\n검토 대기중 ⏳"}
+                        {"type": "mrkdwn", "text": f"*인계 유형:*\n`{sel_type}`"}
                     ]
                 },
                 {
@@ -315,7 +362,14 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                 },
                 {
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*상세 인계 사유:*\n{reason}"}
+                    "text": {"type": "mrkdwn", "text": f"*상세 확인 요청 사항:*\n{reason}"}
+                },
+                {"type": "divider"},
+                {
+                    "type": "context",
+                    "elements": [
+                        {"type": "mrkdwn", "text": "📌 *관리자(SV) 확인 요망*: 검토 후 본 스레드 댓글로 업무 지침을 남겨주세요."}
+                    ]
                 }
             ]
 
