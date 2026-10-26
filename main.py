@@ -75,13 +75,24 @@ def sync_master_knowledge():
 
 sync_master_knowledge()
 
-# 3. 실무 동의어 사전 (짧은 질문이나 다른 표현도 찰떡같이 매칭)
+# 3. 실무 도메인별 엄격 분리 동의어 사전 (해약 vs 청약철회 vs 계약취소 혼동 원천 차단!)
 SYNONYM_MAP = {
+    # [구분 1] 해약/해지 (정식 계약 후 중도해약 - 구비서류 및 환급금 관련)
+    "해약": ["해지", "중도해약", "해약서류", "구비서류", "환급금", "해약환급금"],
+    "해지": ["해약", "중도해약", "해약서류", "구비서류", "환급금"],
+    
+    # [구분 2] 청약철회 (14일 이내 - 별도 서류 불필요, 철회 녹취)
+    "철회": ["청약철회", "14일", "철회녹취"],
+    "청약철회": ["철회", "14일", "철회녹취"],
+    
+    # [구분 3] 계약취소 (임시계약 상태 - 별도 서류 및 녹취 불필요, 요청 시 즉시 처리)
+    "계약취소": ["임시계약", "취소", "청약취소", "접수취소"],
+    "임시계약": ["계약취소", "취소", "결제전"],
+
+    # [기타 주요 실무 키워드]
     "장기연체": ["연체", "미납", "7회", "출금", "재출금", "직권해지"],
     "연체": ["미납", "출금", "재출금", "납부"],
     "미납": ["연체", "출금", "재출금", "납부"],
-    "해약": ["해지", "철회", "구비서류", "서류", "환급"],
-    "해지": ["해약", "철회", "구비서류", "서류"],
     "서류": ["구비서류", "신분증", "초본", "확인서", "대체서류"],
     "귀화": ["외국인", "국적", "초본", "귀화확인서", "정보변경"],
     "대납": ["대리납부", "납부자변경", "타인납부", "직계가족"],
@@ -89,7 +100,7 @@ SYNONYM_MAP = {
 }
 
 def extract_core_stems(text: str):
-    """조사 및 어미 분리 + 동의어 자동 확장"""
+    """조사 및 어미 분리 + 도메인별 정확한 동의어 확장"""
     clean = re.sub(r"[^\w\s가-힣]", " ", text.lower())
     words = clean.split()
     stems = set()
@@ -105,17 +116,16 @@ def extract_core_stems(text: str):
         if len(stripped) >= 2 and stripped != w and stripped not in stop_words:
             stems.add(stripped)
 
-    # 동의어 확장 적용
+    # 동의어 확장 적용 (정확히 일치하거나 핵심어가 포함된 경우만 안전하게 확장)
     expanded = set(stems)
     for s in list(stems):
-        for k, syns in SYNONYM_MAP.items():
-            if k in s or s in k:
-                expanded.update(syns)
+        if s in SYNONYM_MAP:
+            expanded.update(SYNONYM_MAP[s])
 
     return list(expanded)
 
 def get_thread_context(channel_id: str, thread_ts: str, current_ts: str):
-    """[핵심 복구] 스레드 내 이전 대화 맥락(질문+봇 답변 핵심)을 가져와 후속 질문 완벽 이해"""
+    """스레드 내 이전 대화 맥락(질문+봇 답변 핵심)을 가져와 후속 질문 완벽 이해"""
     if not thread_ts or thread_ts == current_ts:
         return "", ""
     try:
@@ -132,7 +142,6 @@ def get_thread_context(channel_id: str, thread_ts: str, current_ts: str):
             txt = re.sub(r"\[질의-AI\]", "", m.get("text", "")).strip()
             if not is_bot:
                 user_keywords_source.append(txt)
-            # 봇의 이전 답변은 앞부분 250자만 요약해서 넣어 토큰 폭발 방지
             short_txt = txt[:250].replace("\n", " ") + ("..." if len(txt) > 250 else "")
             history_lines.append(f"- {role}: {short_txt}")
             
@@ -172,7 +181,7 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
             if stem in ans_clean:
                 score += 15
 
-        # 2. 스레드 이전 질문 핵심어 매칭 (보조 가중치 - "그럼 장기연체일 경우는?" 같은 꼬리질문 해결!)
+        # 2. 스레드 이전 질문 핵심어 매칭 (보조 가중치 - 꼬리질문 해결)
         for p_stem in prev_stems:
             if p_stem not in current_stems:
                 if p_stem in sub_clean:
@@ -202,7 +211,7 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
     return "", False, None
 
 def format_for_slack(text: str) -> str:
-    """AI가 습관적으로 출력하는 **볼드체**를 슬랙 전용 *볼드체*로 완벽 변환 (2번 사진 오류 해결)"""
+    """AI가 습관적으로 출력하는 **볼드체**를 슬랙 전용 *볼드체*로 완벽 변환"""
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
     text = re.sub(r"^#{1,3}\s*(.+)$", r"*\1*", text, flags=re.MULTILINE)
     return text.strip()
@@ -217,7 +226,6 @@ def call_gemini_api(prompt: str):
     if not GEMINI_API_KEYS:
         return False, ""
 
-    # 정식 지원 모델 리스트 (속도 및 할당량 최고 효율)
     models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     num_keys = len(GEMINI_API_KEYS)
 
@@ -236,7 +244,7 @@ def call_gemini_api(prompt: str):
                         )
                     )
                     if res and res.text:
-                        KEY_INDEX = (KEY_INDEX + i + 1) % num_keys  # 다음 호출은 다음 키로 분산!
+                        KEY_INDEX = (KEY_INDEX + i + 1) % num_keys
                         return True, format_for_slack(res.text)
                 except Exception as model_err:
                     err_str = str(model_err)
@@ -313,7 +321,7 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             print(f"❌ 슬랙 전송 실패: {e}")
         return
 
-    # 2. 두 번째 스크린샷의 디테일과 말투를 100% 살려내는 전문 CS 코칭 프롬프트
+    # 2. 실무 도메인 구분(해약 vs 청약철회 vs 계약취소) 및 디테일한 상담 코칭 프롬프트
     prompt = f"""당신은 보람상조(대성글로벌네트워크) 상담사를 실시간으로 코칭하는 최고 수준의 AI 어시스턴트 '대성봇'입니다.
 제공된 [사내 공식 지식 규정]만을 바탕으로, 상담사가 고객과 통화 중 바로 읽고 응대할 수 있도록 다정하고 명확하며 구체적인 가이드를 작성하세요.
 
@@ -326,14 +334,20 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 [사내 공식 지식 규정 (검색된 자료)]:
 {evidence}
 
+[🚨 필수 실무 도메인 구분 원칙 - 절대 혼동 금지!]:
+반드시 아래 3가지 개념을 엄격히 구분하여 답변하세요. 절대 서로 섞어서 안내하면 안 됩니다!
+1. *계약취소*: 초회 출금/결제 전인 *'임시계약'* 상태에서 취소하는 것입니다. 별도의 구비서류도 필요 없고, 별도의 녹취도 필요 없이 고객 요청에 따라 즉시 취소 처리가 가능합니다.
+2. *청약철회 (철회)*: 가입 후 *14일 이내*에 요청하는 철회입니다. 별도의 구비서류는 필요 없으며, 정해진 청약철회 기준(녹취 등)에 따라 처리합니다.
+3. *해약 (해지)*: 정식 계약 유지 중(14일 경과 후) 계약을 해지하는 *중도해약*입니다. 반드시 *구비서류*(신분증 등 유형별 필수 서류) 확인 및 해약 프로세스가 필요합니다.
+
 [작성 및 말투 핵심 지침 - 반드시 준수]:
 1. 단답형이나 단순 복붙을 절대 금지합니다! 상담사가 이해하기 쉽게 전후 맥락과 조건을 친절한 문장('~합니다', '~입니다')으로 풀어서 설명하세요.
 2. 슬랙(Slack) 전용 마크다운을 사용하므로 글씨를 굵게 강조할 때는 별표 두 개(**)가 아닌 별표 한 개(*강조할 단어*)만 사용하세요.
-3. 만약 [사내 공식 지식 규정]을 모두 살펴봐도 상담사의 질문에 답할 근거가 전혀 없다면, 억지로 지어내지 말고 오직 "NO_DATA_FOUND" 라고만 출력하세요. (단, 조금이라도 연관된 기준이나 일반 절차가 있다면 최대한 활용하여 답변하세요.)
+3. 만약 [사내 공식 지식 규정]과 위 원칙을 모두 살펴봐도 상담사의 질문에 답할 근거가 전혀 없다면, 억지로 지어내지 말고 오직 "NO_DATA_FOUND" 라고만 출력하세요.
 4. 각 섹션의 역할:
-   - 📢 *[핵심 답변]*: 질문에 대한 결론부터 두괄식으로 1~3문장으로 명확히 요약하고, 조건(예: 납부 이력 유무, 상황별 차이 등)에 따라 달라진다면 첫 단락 아래에 불릿(-)으로 한눈에 비교해 주세요.
+   - 📢 *[핵심 답변]*: 질문에 대한 결론부터 두괄식으로 1~3문장으로 명확히 요약하고, 조건(예: 납부 이력 유무, 계약 상태별 차이 등)에 따라 달라진다면 첫 단락 아래에 불릿(-)으로 한눈에 비교해 주세요.
    - 💡 *[상세 기준]*: 회차별/상황별/유형별 세부 기준, 진행 절차, 필수 구비서류 등을 하위 불릿(-)과 들여쓰기를 활용해 체계적이고 꼼꼼하게 정리하세요.
-   - 📌 *[상담 가이드 & 팁]*: 상담사가 전산에서 먼저 확인해야 할 포인트, 오안내 방지를 위한 주의사항, 고객에게 차분하게 안내할 추천 응대 화법/멘트를 2~3가지 풍부하게 작성하세요.
+   - 📌 *[상담 가이드 & 팁]*: 상담사가 전산에서 먼저 확인해야 할 포인트(예: 임시계약 상태인지, 14일 이내인지, 납부 이력이 있는지 등), 오안내 방지를 위한 주의사항, 고객 응대 화법 팁을 2~3가지 풍부하게 작성하세요.
 
 [반드시 준수할 출력 서식]:
 📢 *[핵심 답변]*:
@@ -397,7 +411,7 @@ def manual_sync():
 
 @app.post("/slack/events")
 async def handle_slack_events(request: Request, background_tasks: BackgroundTasks):
-    # [핵심] 슬랙 3초 타임아웃 재전송(Retry) 헤더 감지 시 즉시 무시 (중복 응답/중복 버튼 완벽 차단!)
+    # 슬랙 3초 타임아웃 재전송(Retry) 헤더 감지 시 즉시 무시 (중복 응답/중복 버튼 완벽 차단!)
     if request.headers.get("x-slack-retry-num"):
         return {"status": "ignored_retry"}
 
