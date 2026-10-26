@@ -12,15 +12,22 @@ from slack_sdk import WebClient
 
 app = FastAPI()
 
-# 1. 환경변수 로드
+# 1. 환경변수 로드 및 3개 이상의 API 키 안전 수집 (429 에러 완벽 분산)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-raw_keys = [
-    os.environ.get("GEMINI_API_KEY_1"),
-    os.environ.get("GEMINI_API_KEY_2"),
-    os.environ.get("GEMINI_API_KEY_3"),
-    os.environ.get("GEMINI_API_KEY"),
-]
-GEMINI_API_KEYS = list(dict.fromkeys([k.strip() for k in raw_keys if k and k.strip()]))
+
+GEMINI_API_KEYS = []
+for i in range(1, 6):
+    k = os.environ.get(f"GEMINI_API_KEY_{i}")
+    if k and k.strip():
+        GEMINI_API_KEYS.append(k.strip())
+
+fallback_key = os.environ.get("GEMINI_API_KEY")
+if fallback_key and fallback_key.strip():
+    GEMINI_API_KEYS.append(fallback_key.strip())
+
+GEMINI_API_KEYS = list(dict.fromkeys(GEMINI_API_KEYS))
+print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
+
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
 PROCESSED_EVENTS = OrderedDict()
@@ -199,18 +206,20 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
     return "", False, None
 
 def format_for_slack(text: str) -> str:
-    # 앱 스크립트처럼 슬랙 전용 *볼드체*로 완벽 변환
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
     text = re.sub(r"^#{1,3}\s*(.+)$", r"*\1*", text, flags=re.MULTILINE)
     return text.strip()
 
 def call_gemini_api_rest(prompt: str):
+    """3개의 API 키와 모델을 순회하며 429/타임아웃 발생 시 에러 코드와 함께 실패 반환"""
     global KEY_INDEX
     if not GEMINI_API_KEYS:
-        return False, ""
+        return False, "ERROR: NO_API_KEYS_CONFIGURED"
 
     models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
     num_keys = len(GEMINI_API_KEYS)
+
+    last_error_code = "UNKNOWN_ERROR"
 
     for i in range(num_keys):
         current_key = GEMINI_API_KEYS[(KEY_INDEX + i) % num_keys]
@@ -225,20 +234,29 @@ def call_gemini_api_rest(prompt: str):
                 }
             }
             try:
-                res = requests.post(url, headers=headers, json=payload, timeout=25)
-                if res.status_code == 200:
+                res = requests.post(url, headers=headers, json=payload, timeout=20)
+                status = res.getResponseCode() if hasattr(res, 'getResponseCode') else res.status_code
+                
+                if status == 200:
                     data = res.json()
                     text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     if text:
                         KEY_INDEX = (KEY_INDEX + i + 1) % num_keys
                         return True, format_for_slack(text)
-                elif res.status_code == 429:
-                    time.sleep(1.0)
+                elif status == 429:
+                    last_error_code = "429_RESOURCE_EXHAUSTED"
+                    time.sleep(0.5)
                     continue
-            except Exception as e:
-                print(f"⚠️ REST API 호출 예외 ({m}): {e}")
+                else:
+                    last_error_code = f"HTTP_{status}"
+            except requests.exceptions.Timeout:
+                last_error_code = "TIMEOUT_ERROR"
                 continue
-    return False, ""
+            except Exception as e:
+                last_error_code = f"EXCEPTION_{str(e)[:20]}"
+                continue
+                
+    return False, last_error_code
 
 def build_polite_escalation_blocks(question: str, channel_id: str, thread_ts: str):
     meta_val = json.dumps({"c": channel_id, "t": thread_ts, "q": question[:80]}, ensure_ascii=False)
@@ -297,7 +315,6 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             print(f"❌ 슬랙 전송 실패: {e}")
         return
 
-    # [핵심] 앱 스크립트 시절의 정교한 실무 규정 데이터와 도메인 구분 규칙을 그대로 주입한 프롬프트
     prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트 '대성봇'입니다.
 제공된 [📚AI_마스터지식 공식 규정]과 [실무 기준]을 엄격하게 준수하여 상담사에게 가장 정확하고 친절한 실무 답변을 완성하세요.
 
@@ -358,14 +375,16 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             pass
         return
 
+    # [수정] API 통신 실패 및 429 에러 발생 시, 원문 대신 깔끔한 에러 코드를 스레드로 회신
     if success and ai_reply:
         final_text = ai_reply
     else:
-        cleaned_ans = format_for_slack(best_item['answer']) if best_item else "등록된 규정 내용이 없습니다."
+        err_code = ai_reply if ai_reply else "UNKNOWN_ERROR"
         final_text = (
-            f"📢 *[핵심 답변]*:\n*{best_item.get('sub', '업무')}* 관련 규정 안내드립니다.\n\n"
-            f"💡 *[상세 기준]*:\n{cleaned_ans}\n\n"
-            f"📌 *[상담 가이드 & 팁]*:\n- 본 내용은 사내 마스터 지식 원문 기준입니다. 상세 전산 처리 시 재확인 부탁드립니다."
+            f"⚠️ *[AI 응답 일시 중단]*\n"
+            f"요청 처리 중 시스템 제한(API 할당량 초과 또는 통신 지연)이 발생했습니다.\n\n"
+            f"📋 *[스레드 에러 코드]*: `{err_code}`\n"
+            f"💡 잠시 후 다시 질문해 주시거나, 동일 현상 지속 시 관리자(SV)에게 문의해 주세요."
         )
 
     try:
