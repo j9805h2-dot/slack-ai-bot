@@ -12,7 +12,7 @@ from slack_sdk import WebClient
 
 app = FastAPI()
 
-# 1. 환경변수 로드 및 3개 이상의 API 키 안전 수집 (429 에러 완벽 분산)
+# 1. 환경변수 로드 및 API 키 수집
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
 GEMINI_API_KEYS = []
@@ -79,7 +79,7 @@ def sync_master_knowledge():
 
 sync_master_knowledge()
 
-# 3. 실무 도메인별 엄격 분리 및 상품/프로세스 확장 동의어 사전
+# 3. 동의어 사전
 SYNONYM_MAP = {
     "해약": ["해지", "중도해약", "해약서류", "구비서류", "환급금", "해약환급금"],
     "해지": ["해약", "중도해약", "해약서류", "구비서류", "환급금"],
@@ -110,7 +110,6 @@ def extract_core_stems(text: str):
     clean = re.sub(r"[^\w\s가-힣]", " ", text.lower())
     words = clean.split()
     stems = set()
-    
     stop_words = {"알려줘", "뭐야", "뭐가", "어떻게", "언제", "얼마", "확인해줘", "답변", "부탁", "경우", "경우는", "관련", "그럼", "만약", "필요해", "하나요", "할까요", "있나요"}
     josa_pattern = r"(시에는|일때는|할때는|경우에는|경우는|에서는|이라도|시엔|할때|에는|에서|에게|으로|까지|부터|마다|이면|면|의|과|와|을|를|은|는|이|가|도|만|시|해|요|죠)$"
 
@@ -133,25 +132,24 @@ def get_thread_context(channel_id: str, thread_ts: str, current_ts: str):
     if not thread_ts or thread_ts == current_ts:
         return "", ""
     try:
-        res = slack_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=6)
+        res = slack_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=4)
         msgs = res.get("messages", [])
         if len(msgs) <= 1:
             return "", ""
         
         history_lines = []
         user_keywords_source = []
-        for m in msgs[:-1][-4:]:
+        for m in msgs[:-1][-3:]:
             is_bot = bool(m.get("bot_id"))
             role = "대성봇" if is_bot else "상담사"
             txt = re.sub(r"\[질의-AI\]", "", m.get("text", "")).strip()
             if not is_bot:
                 user_keywords_source.append(txt)
-            short_txt = txt[:250].replace("\n", " ") + ("..." if len(txt) > 250 else "")
+            short_txt = txt[:150].replace("\n", " ")
             history_lines.append(f"- {role}: {short_txt}")
             
         return "\n".join(history_lines), " ".join(user_keywords_source)
     except Exception as e:
-        print(f"⚠️ 스레드 맥락 조회 실패: {e}")
         return "", ""
 
 def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
@@ -167,26 +165,18 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
         ans_clean = item["answer"].lower()
 
         for stem in current_stems:
-            if stem in sub_clean:
-                score += 120
-            if stem in q_clean:
-                score += 80
+            if stem in sub_clean: score += 120
+            if stem in q_clean: score += 80
             for kw in item["keywords"]:
-                if stem == kw:
-                    score += 60
-                elif stem in kw or kw in stem:
-                    score += 25
-            if stem in ans_clean:
-                score += 15
+                if stem == kw: score += 60
+                elif stem in kw or kw in stem: score += 25
+            if stem in ans_clean: score += 15
 
         for p_stem in prev_stems:
             if p_stem not in current_stems:
-                if p_stem in sub_clean:
-                    score += 45
-                if p_stem in q_clean:
-                    score += 30
-                if p_stem in ans_clean:
-                    score += 10
+                if p_stem in sub_clean: score += 45
+                if p_stem in q_clean: score += 30
+                if p_stem in ans_clean: score += 10
 
         if len(clean_q) >= 2 and (clean_q in sub_clean or clean_q in q_clean):
             score += 100
@@ -197,9 +187,9 @@ def search_memory_knowledge(current_query: str, prev_user_queries: str = ""):
     scored.sort(key=lambda x: x[0], reverse=True)
     
     if scored:
-        top_items = [s[1] for s in scored[:5]]
-        combined_text = "\n\n---\n\n".join([
-            f"[{it['category']} > {it['sub']} | {it['question']}]\n{it['answer'][:700]}"
+        top_items = [s[1] for s in scored[:3]]
+        combined_text = "\n\n".join([
+            f"[{it['sub']} | {it['question']}]\n{it['answer'][:500]}"
             for it in top_items
         ])
         return combined_text, True, top_items[0]
@@ -211,50 +201,56 @@ def format_for_slack(text: str) -> str:
     return text.strip()
 
 def call_gemini_api_rest(prompt: str):
-    """3개의 API 키와 모델을 순회하며 429/타임아웃 발생 시 에러 코드와 함께 실패 반환"""
+    """
+    [429 에러 방어 핵심]
+    - 3개의 키와 모델을 순회하며, 429 발생 시 강제로 2~3초씩 숨을 고르고(Backoff) 재시도합니다.
+    """
     global KEY_INDEX
     if not GEMINI_API_KEYS:
         return False, "ERROR: NO_API_KEYS_CONFIGURED"
 
     models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
     num_keys = len(GEMINI_API_KEYS)
-
     last_error_code = "UNKNOWN_ERROR"
 
-    for i in range(num_keys):
-        current_key = GEMINI_API_KEYS[(KEY_INDEX + i) % num_keys]
-        for m in models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={current_key}"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 2048
+    # 총 2번의 라운드(키 전체 순회)를 돌며 재시도 보장
+    for attempt in range(2):
+        for i in range(num_keys):
+            current_key = GEMINI_API_KEYS[(KEY_INDEX + i) % num_keys]
+            for m in models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={current_key}"
+                headers = {"Content-Type": "application/json"}
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.1,
+                        "maxOutputTokens": 1000
+                    }
                 }
-            }
-            try:
-                res = requests.post(url, headers=headers, json=payload, timeout=20)
-                status = res.getResponseCode() if hasattr(res, 'getResponseCode') else res.status_code
-                
-                if status == 200:
-                    data = res.json()
-                    text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                    if text:
-                        KEY_INDEX = (KEY_INDEX + i + 1) % num_keys
-                        return True, format_for_slack(text)
-                elif status == 429:
-                    last_error_code = "429_RESOURCE_EXHAUSTED"
-                    time.sleep(0.5)
+                try:
+                    res = requests.post(url, headers=headers, json=payload, timeout=20)
+                    status = res.status_code
+                    
+                    if status == 200:
+                        data = res.json()
+                        text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                        if text:
+                            KEY_INDEX = (KEY_INDEX + i + 1) % num_keys
+                            return True, format_for_slack(text)
+                    elif status == 429:
+                        last_error_code = "429_RESOURCE_EXHAUSTED"
+                        # 429가 뜨면 2초간 강제로 숨 고르기 후 다음 키/모델로 즉시 전환
+                        time.sleep(2.0)
+                        continue
+                    else:
+                        last_error_code = f"HTTP_{status}"
+                except Exception as e:
+                    last_error_code = f"EXCEPTION_{str(e)[:15]}"
+                    time.sleep(1.0)
                     continue
-                else:
-                    last_error_code = f"HTTP_{status}"
-            except requests.exceptions.Timeout:
-                last_error_code = "TIMEOUT_ERROR"
-                continue
-            except Exception as e:
-                last_error_code = f"EXCEPTION_{str(e)[:20]}"
-                continue
+        
+        # 첫 번째 바퀴에서 모두 실패하면 3초 쉬고 두 번째 바퀴 시도
+        time.sleep(3.0)
                 
     return False, last_error_code
 
@@ -311,56 +307,34 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             )
             slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
             slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="white_check_mark")
-        except Exception as e:
-            print(f"❌ 슬랙 전송 실패: {e}")
+        except Exception:
+            pass
         return
 
-    prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트 '대성봇'입니다.
-제공된 [📚AI_마스터지식 공식 규정]과 [실무 기준]을 엄격하게 준수하여 상담사에게 가장 정확하고 친절한 실무 답변을 완성하세요.
+    prompt = f"""당신은 보람상조 전문 AI 어시스턴트 '대성봇'입니다. 아래 [사내 공식 규정]을 바탕으로 상담사에게 친절하고 구체적인 실무 가이드를 작성하세요.
 
-[이전 스레드 대화 맥락]:
-{thread_history if thread_history else "없음 (신규 질문)"}
+[상담사 질문]: "{question}"
 
-[상담사 질문]: "${question}"
-
-[★보람 상품 및 전환 서비스 공식 상세 규정 (실물 계약표 기준)]:
-1. **비앤케어팩(B&케어팩)**: 총 594만 원(160개월). 160회 만기 완납 시 100% 환급되는 결합상품.
-2. **비앤케어팩 4대 캐시백 상세 금액 (정규 입금일: 매월 28일)**:
-   - 2~37 캐쉬백: 1회 0원 / 2~11회(10개월) 월 47,500원 / 12~37회(26개월) 월 37,500원 / 38회 이후 0원 (총 145만 원)
-   - 4~48 캐쉬백: 1~3회 0원 / 4~47회(44개월) 월 32,230원 / 48회 31,880원 / 49회 이후 0원 (총 145만 원)
-   - 4~60 캐쉬백: 1~3회 0원 / 4~59회(56개월) 월 25,440원 / 60회 25,360원 / 61회 이후 0원 (총 145만 원)
-   - 4~72 캐쉬백: 1~3회 0원 / 4~71회(68개월) 월 21,020원 / 72회 20,640원 / 73회 이후 0원 (총 145만 원)
-3. **사망/임종 발생 및 장례 행사 규정**:
-   - 임종 직후 24시간 상황실 즉시 접수 (장례지도사 긴급 출동).
-   - 잔여금 완납 룰: 만기 전 장례 행사 발생 시 발인 전까지 잔여 납부금 일시 완납 필수.
-4. **구비서류 및 상태별 엄격 기준**:
-   - *계약취소*: 초회 출금/결제 전인 '임시계약' 상태. 구비서류 및 녹취 불필요, 고객 요청 시 즉시 취소 가능.
-   - *청약철회*: 가입 후 14일 이내. 서류 불필요, 철회 녹취 진행.
-   - *해약(해지)*: 정식 계약 유지 중(14일 경과 후) 중도해약. 신분증 등 구비서류 필수 확인.
-   - *대리납부(직계가족)*: 초회는 [신분증 2개], 초회 이후는 [신분증 2개 + 3개월 내 가족관계증명서 + 통장사본].
-   - *외국인 실명인증*: 외국인등록증 앞/뒷면 (체류기간 필수).
-   - *개명*: 3개월 내 주민등록초본(개명 전후 기재) + 신분증.
-
-[📚AI_마스터지식 선별 결과]:
+[사내 공식 규정 (검색된 자료)]:
 {evidence}
 
-[답변 원칙 및 서식]:
-1. 마스터 지식이나 위 규정에 명확한 근거가 전혀 없다면 첫 줄에 반드시 "[UNANSWERED]"라고만 적으세요.
-2. 근거가 있다면 반드시 아래 표준 양식으로 작성하세요. (글씨 강조는 슬랙용 별표 한 개 *강조*만 사용)
+[원칙]:
+1. 슬랙 마크다운 특성상 굵은 글씨는 별표 한 개(*강조*)만 사용하세요.
+2. 근거가 없다면 "NO_DATA_FOUND"만 출력하세요.
+3. 출력 서식:
 📢 *[핵심 답변]*:
-(결론 및 핵심 요약 1~3문장)
+(결론 및 요약)
 
 💡 *[상세 기준]*:
-- *구분/조건 1*: 세부 기준 및 절차
-- *구분/조건 2*: 세부 기준 및 절차
+- *구분*: 내용
 
 📌 *[상담 가이드 & 팁]*:
-- (전산 확인 포인트 및 실무 응대 화법 팁)
+- (응대 팁)
 """
 
     success, ai_reply = call_gemini_api_rest(prompt)
 
-    if success and ("[UNANSWERED]" in ai_reply or "NO_DATA_FOUND" in ai_reply):
+    if success and "NO_DATA_FOUND" in ai_reply:
         blocks = build_polite_escalation_blocks(question, channel_id, thread_ts)
         slack_client.chat_postMessage(
             channel=channel_id,
@@ -375,22 +349,20 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
             pass
         return
 
-    # [수정] API 통신 실패 및 429 에러 발생 시, 원문 대신 깔끔한 에러 코드를 스레드로 회신
     if success and ai_reply:
         final_text = ai_reply
     else:
         err_code = ai_reply if ai_reply else "UNKNOWN_ERROR"
         final_text = (
             f"⚠️ *[AI 응답 일시 중단]*\n"
-            f"요청 처리 중 시스템 제한(API 할당량 초과 또는 통신 지연)이 발생했습니다.\n\n"
-            f"📋 *[스레드 에러 코드]*: `{err_code}`\n"
-            f"💡 잠시 후 다시 질문해 주시거나, 동일 현상 지속 시 관리자(SV)에게 문의해 주세요."
+            f"요청 폭주로 인한 일시적 통신 제한(429)이 발생했습니다. 잠시 후(3~5초 뒤) 다시 질문해 주세요!\n\n"
+            f"📋 *[에러 코드]*: `{err_code}`"
         )
 
     try:
         slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=final_text, mrkdwn=True)
-    except Exception as e:
-        print(f"❌ 슬랙 전송 실패: {e}")
+    except Exception:
+        pass
 
     try:
         slack_client.reactions_remove(channel=channel_id, timestamp=message_ts, name="eyes")
@@ -439,10 +411,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                     "submit": {"type": "plain_text", "text": "요청서 제출", "emoji": True},
                     "close": {"type": "plain_text", "text": "취소", "emoji": True},
                     "blocks": [
-                        {
-                            "type": "section",
-                            "text": {"type": "mrkdwn", "text": f"📋 *상담사 원본 질문*\n>{orig_q}"}
-                        },
+                        {"type": "section", "text": {"type": "mrkdwn", "text": f"📋 *상담사 원본 질문*\n>{orig_q}"}},
                         {"type": "divider"},
                         {
                             "type": "input",
@@ -475,8 +444,8 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                 }
                 try:
                     slack_client.views_open(trigger_id=trigger_id, view=modal_view)
-                except Exception as e:
-                    print(f"❌ 모달 팝업 오류: {e}")
+                except Exception:
+                    pass
                 return {"status": "ok"}
 
             elif action_id == "dismiss_escalate":
@@ -487,10 +456,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                         channel=channel_id,
                         ts=message_ts,
                         text="취소되었습니다.",
-                        blocks=[{
-                            "type": "context",
-                            "elements": [{"type": "mrkdwn", "text": "ℹ️ *관리자 확인 요청이 취소되었습니다.*"}]
-                        }]
+                        blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": "ℹ️ *관리자 확인 요청이 취소되었습니다.*"}]}]
                     )
                 except Exception:
                     pass
@@ -512,13 +478,7 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
             notice_blocks = [
                 {"type": "header", "text": {"type": "plain_text", "text": "🚨 [관리자(SV) 업무 인계 접수]", "emoji": True}},
-                {
-                    "type": "section",
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*요청 상담사:*\n<@{user_id}> ({user_name})"},
-                        {"type": "mrkdwn", "text": f"*인계 유형:*\n`{sel_type}`"}
-                    ]
-                },
+                {"type": "section", "fields": [{"type": "mrkdwn", "text": f"*요청 상담사:*\n<@{user_id}> ({user_name})"}, {"type": "mrkdwn", "text": f"*인계 유형:*\n`{sel_type}`"}]},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*상담사 원본 질문:*\n>{orig_q}"}},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*상세 확인 요청 사항:*\n{reason}"}},
                 {"type": "divider"},
@@ -526,14 +486,9 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
             ]
 
             try:
-                slack_client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    blocks=notice_blocks,
-                    text=f"🚨 [관리자 확인 요청] {orig_q}"
-                )
-            except Exception as e:
-                print(f"❌ 인계 카드 전송 실패: {e}")
+                slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, blocks=notice_blocks, text=f"🚨 [관리자 확인 요청] {orig_q}")
+            except Exception:
+                pass
 
             return {"response_action": "clear"}
 
@@ -562,23 +517,9 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
         if text.startswith("[질의-AI]"):
             question = text.replace("[질의-AI]", "").strip()
-            background_tasks.add_task(
-                async_bot_worker,
-                channel_id,
-                thread_ts if thread_ts else message_ts,
-                message_ts,
-                question,
-                False
-            )
+            background_tasks.add_task(async_bot_worker, channel_id, thread_ts if thread_ts else message_ts, message_ts, question, False)
         elif thread_ts and thread_ts != message_ts:
             if len(text) >= 2:
-                background_tasks.add_task(
-                    async_bot_worker,
-                    channel_id,
-                    thread_ts,
-                    message_ts,
-                    text,
-                    True
-                )
+                background_tasks.add_task(async_bot_worker, channel_id, thread_ts, message_ts, text, True)
 
     return {"status": "ok"}
