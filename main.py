@@ -8,18 +8,20 @@ from slack_sdk import WebClient
 
 app = FastAPI()
 
-# 1. 환경변수
+# 1. 환경변수 (다중 키 및 단일 키 모두 자동 인식)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-API_KEYS = [
+
+raw_keys = [
     os.environ.get("GEMINI_API_KEY_1"),
     os.environ.get("GEMINI_API_KEY_2"),
     os.environ.get("GEMINI_API_KEY_3"),
+    os.environ.get("GEMINI_API_KEY"),
 ]
-GEMINI_API_KEYS = [k.strip() for k in API_KEYS if k]
+GEMINI_API_KEYS = list(dict.fromkeys([k.strip() for k in raw_keys if k and k.strip()]))
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# 2. 마스터 지식 시트 캐싱
+# 2. 마스터 지식 시트 캐싱 (1,347건 초고속 로드)
 MASTER_SHEET_ID = "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4"
 CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=%F0%9F%93%9AAI_%EB%A7%88%EC%8A%A4%ED%84%B0%EC%A7%80%EC%8B%9D"
 
@@ -28,7 +30,7 @@ CACHED_KNOWLEDGE = []
 def sync_master_knowledge():
     global CACHED_KNOWLEDGE
     try:
-        res = requests.get(CSV_EXPORT_URL, timeout=8)
+        res = requests.get(CSV_EXPORT_URL, timeout=15)
         if res.status_code == 200:
             f = io.StringIO(res.text)
             reader = csv.reader(f)
@@ -85,7 +87,6 @@ def search_memory_knowledge(query: str) -> str:
     return "\n\n---\n\n".join([item[1] for item in scored[:3]])
 
 def call_gemini_direct_rest(prompt: str) -> str:
-    # 503 트래픽 과부하를 회피하기 위해 다중 모델 순환
     models = [
         "gemini-2.0-flash",
         "gemini-2.5-flash",
@@ -104,11 +105,12 @@ def call_gemini_direct_rest(prompt: str) -> str:
         for key in GEMINI_API_KEYS:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
             try:
+                # 넉넉하게 30초 타임아웃 적용
                 res = requests.post(
                     url,
                     headers={"Content-Type": "application/json"},
                     json=payload,
-                    timeout=5
+                    timeout=30
                 )
                 if res.status_code == 200:
                     data = res.json()
@@ -116,7 +118,7 @@ def call_gemini_direct_rest(prompt: str) -> str:
                     if parts and "text" in parts[0]:
                         return parts[0]["text"]
                 elif res.status_code == 503:
-                    last_err = f"503 모델 과부하({model})"
+                    last_err = f"503 과부하({model})"
                     continue
                 else:
                     last_err = f"API 오류 {res.status_code}: {res.text[:100]}"
@@ -127,18 +129,18 @@ def call_gemini_direct_rest(prompt: str) -> str:
     return f"⚠️ 지식 조회 오류: {last_err}"
 
 def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question: str):
-    # 1. 눈 이모지
+    # 1. 눈 이모지 등록
     try:
         slack_client.reactions_add(channel=channel_id, timestamp=message_ts, name="eyes")
     except Exception:
         pass
 
-    # 2. 1,347건 마스터 지식 검색
+    # 2. 1,347건 메모리에서 초고속 규정 검색
     evidence = search_memory_knowledge(question)
 
-    # 3. Gemini 프롬프트 구성 및 REST 호출
+    # 3. Gemini REST 호출 (최대 30초 대기)
     prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트입니다.
-반드시 아래 [사내 공식 규정]에 명시된 내용만을 기반으로 정확하게 작성하세요. 지식에 없는 내용은 절대 지어내지 마세요.
+반드시 아래 [사내 공식 규정]에 명시된 내용만을 기반으로 신속 정확하게 답변을 작성하세요.
 
 [상담사 질문]: {question}
 
@@ -147,14 +149,13 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
 [답변 가이드]:
 📢 *[핵심 답변]*: (결론 및 필수 구비서류)
-💡 *[상세 기준]*: (상세 내역 및 프로세스)
+💡 *[상세 기준]*: (상세 내역 및 진행 프로세스)
 📌 *[상담 가이드 & 팁]*: (실무 유의사항)
 (※ 규정에 없는 내용일 경우 '사내 공식 지식에 미등록된 항목이므로 SV 확인이 필요합니다' 명시)"""
 
-    # 함수명 오타 수정 완료
     reply_text = call_gemini_direct_rest(prompt)
 
-    # 4. 스레드 전송
+    # 4. 슬랙 스레드 답변 전송
     try:
         slack_client.chat_postMessage(
             channel=channel_id,
