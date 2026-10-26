@@ -3,13 +3,14 @@ import re
 import csv
 import io
 import json
+import urllib.parse
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
 
 app = FastAPI()
 
-# 1. 슬랙 및 API 환경변수 로드
+# 1. 환경변수
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 raw_keys = [
     os.environ.get("GEMINI_API_KEY_1"),
@@ -18,10 +19,9 @@ raw_keys = [
     os.environ.get("GEMINI_API_KEY"),
 ]
 GEMINI_API_KEYS = list(dict.fromkeys([k.strip() for k in raw_keys if k and k.strip()]))
-
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# 2. 독립형 마스터 지식 시트 캐싱 (1,347건)
+# 2. 마스터 지식 시트 캐싱 (1,347건)
 MASTER_SHEET_ID = "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4"
 CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=%F0%9F%93%9AAI_%EB%A7%88%EC%8A%A4%ED%84%B0%EC%A7%80%EC%8B%9D"
 
@@ -67,26 +67,34 @@ def sync_master_knowledge():
 sync_master_knowledge()
 
 def search_memory_knowledge(query: str):
-    """키워드 가중치 기반 고속 색인 탐색"""
     clean_q = re.sub(r"[^\w\s가-힣]", " ", query.lower())
-    tokens = [t for t in clean_q.split() if len(t) > 1]
+    stop_words = {"서류", "필요", "뭐야", "알려줘", "관련", "대해", "어떻게", "확인", "부탁"}
+    tokens = [t for t in clean_q.split() if len(t) > 1 and t not in stop_words]
 
     scored = []
     for item in CACHED_KNOWLEDGE:
         score = 0
-        for token in tokens:
-            for kw in item["keywords"]:
-                if token in kw or kw in token:
-                    score += 6
-            if token in item["question"].lower():
-                score += 18
+        sub_lower = item["sub"].lower()
+        q_lower = item["question"].lower()
 
-        if score > 0:
-            scored.append((score, f"[{item['category']} > {item['sub']} - {item['question']}]\n{item['answer']}"))
+        for token in tokens:
+            if token in sub_lower:
+                score += 50
+            if token in q_lower:
+                score += 30
+            for kw in item["keywords"]:
+                if token == kw:
+                    score += 20
+                elif token in kw:
+                    score += 5
+
+        if score >= 20:
+            content = f"[{item['category']} > {item['sub']} - {item['question']}]\n{item['answer']}"
+            scored.append((score, content))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    matched_text = "\n\n---\n\n".join([item[1] for item in scored[:3]])
-    return matched_text, len(scored) > 0
+    matched_items = [s[1] for s in scored[:2]]
+    return "\n\n---\n\n".join(matched_items), len(matched_items) > 0
 
 def call_gemini_api(prompt: str) -> str:
     models = ["gemini-2.5-flash", "gemini-2.0-flash"]
@@ -115,8 +123,8 @@ def call_gemini_api(prompt: str) -> str:
     return ""
 
 def build_escalation_blocks(reply_text: str, channel_id: str, thread_ts: str, question: str):
-    """관리자 인계 버튼이 포함된 슬랙 블록 생성"""
-    meta_val = json.dumps({"c": channel_id, "t": thread_ts, "q": question[:40]}, ensure_ascii=False)
+    # 모달 생성 시 질문 원문을 전달하기 위한 메타데이터
+    meta_val = json.dumps({"c": channel_id, "t": thread_ts, "q": question[:80]}, ensure_ascii=False)
     return [
         {
             "type": "section",
@@ -143,45 +151,52 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
     except Exception:
         pass
 
-    # 1. 관리자 인계 트리거 키워드 검사
     direct_escalate_keywords = ["관리자", "sv", "담당자", "인계", "연결해"]
     is_direct_escalate = any(k in question.lower() for k in direct_escalate_keywords)
-
     correction_keywords = ["틀렸", "달라", "아닌", "다시", "확인해", "오답", "이상해"]
     is_correction = any(k in question.lower() for k in correction_keywords)
 
-    # 2. 마스터 지식 검색
     evidence, has_match = search_memory_knowledge(question)
 
-    # 3. 프롬프트 작성
     prompt = f"""당신은 고객센터 상담사를 실시간으로 돕는 전문 AI 어시스턴트입니다.
-사내 공식 규정이 존재하는 경우 반드시 그 내용만을 기반으로 정확하게 답변하세요.
+제공된 [사내 공식 규정]을 바탕으로 명확하게 가공 및 정제하여 작성하세요.
+절대로 원본 데이터를 복사-붙여넣기 하듯 투박하게 출력하지 마세요.
 
 [상담사 질문]: {question}
 
 [사내 공식 규정]:
-{evidence if has_match else "사내 공식 규정 없음 (일반 상식/날씨 등 문의일 경우 일반적인 정확한 정보로 친절히 답변할 것)"}
+{evidence if has_match else "사내 규정에 명시되어 있지 않음"}
 
-[답변 서식 가이드]:
-📢 *[핵심 답변]*: (결론 및 핵심 요약 2~3줄)
-💡 *[상세 기준]*: (세부 진행 조건, 단계별 절차)
-📌 *[상담 가이드 & 팁]*: (실무 팁 및 유의사항)
-"""
+[반드시 준수할 정제 출력 서식]:
+📢 *[핵심 답변]*:
+(결론 및 필수 구비서류 목록을 보기 쉽게 번호나 글머리 기호로 정돈)
+
+💡 *[상세 기준]*:
+- **진행 프로세스**: 서류 접수 및 전산 처리 절차
+- **대체 가능 서류**: 대체 서류 기준 및 유효기간 등
+
+📌 *[상담 가이드 & 팁]*:
+- 상담 시 필수 확인 사항 및 안내 꿀팁
+
+(※ 규정이 없는 경우 '사내 공식 지식에 미등록된 항목이므로 SV 확인이 필요합니다.' 명시)"""
+
     ai_reply = call_gemini_api(prompt)
 
-    # 4. 인계 버튼 부착 여부 결정
     need_button = False
     if is_direct_escalate or is_correction or not has_match or not ai_reply:
         need_button = True
 
     if ai_reply and ai_reply.strip():
         final_text = ai_reply
-    elif evidence:
-        final_text = f"📢 *[핵심 답변]*:\n사내 마스터 규정 조회 결과입니다.\n\n{evidence}\n\n📌 *[상담 가이드 & 팁]*:\n- 공식 규정 원문을 기반으로 상담을 진행해 주세요."
+    elif has_match:
+        final_text = (
+            f"📢 *[핵심 답변]*:\n사내 마스터 규정 조회 결과입니다.\n\n"
+            f"{evidence}\n\n"
+            f"📌 *[상담 가이드 & 팁]*:\n- 최신 업무 지침 기준에 맞춰 상담을 진행해 주세요."
+        )
     else:
         final_text = "📢 *[핵심 답변]*:\n사내 공식 지식에 등록되지 않은 항목입니다.\n\n📌 *[상담 가이드 & 팁]*:\n- 정확한 안내를 위해 아래 버튼을 눌러 SV(관리자) 확인을 진행해 주세요."
 
-    # 5. 슬랙 전송
     try:
         if need_button:
             blocks = build_escalation_blocks(final_text, channel_id, thread_ts, question)
@@ -211,75 +226,133 @@ def manual_sync():
 
 @app.post("/slack/events")
 async def handle_slack_events(request: Request, background_tasks: BackgroundTasks):
-    content_type = request.headers.get("content-type", "")
+    body_bytes = await request.body()
+    body_str = body_bytes.decode("utf-8")
 
-    # A. 버튼 클릭 및 모달 팝업 상호작용 (application/x-www-form-urlencoded)
-    if "application/x-www-form-urlencoded" in content_type:
-        form_data = await request.form()
-        payload = json.loads(form_data.get("payload", "{}"))
+    # 1. 버튼 클릭 및 모달 팝업 상호작용 (URL-Encoded payload 파싱)
+    if body_str.startswith("payload="):
+        parsed = urllib.parse.parse_qs(body_str)
+        raw_payload = parsed.get("payload", ["{}"])[0]
+        payload = json.loads(raw_payload)
         p_type = payload.get("type")
 
-        # 1) [🚨 관리자(SV) 확인 요청] 버튼 클릭 시 모달 열기
+        # A. [🚨 관리자(SV) 확인 요청] 버튼 클릭 시 모달 팝업 오픈
         if p_type == "block_actions":
             trigger_id = payload.get("trigger_id")
             action = payload.get("actions", [{}])[0]
             action_val = action.get("value", "{}")
-            
+            meta_dict = json.loads(action_val)
+            orig_q = meta_dict.get("q", "문의 내용 없음")
+
+            # 기존 관리자 인계 질의서 모달 폼 완벽 복원
             modal_view = {
                 "type": "modal",
                 "callback_id": "submit_escalate_modal",
                 "private_metadata": action_val,
-                "title": {"type": "plain_text", "text": "관리자(SV) 확인 요청"},
-                "submit": {"type": "plain_text", "text": "제출하기"},
+                "title": {"type": "plain_text", "text": "관리자(SV) 인계 질의서"},
+                "submit": {"type": "plain_text", "text": "인계 요청 전송"},
                 "close": {"type": "plain_text", "text": "취소"},
                 "blocks": [
                     {
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": "⚠️ *AI 답변 내용에 이상이 있거나 추가 확인이 필요한가요?*\n상세 사유를 적어주시면 관리자에게 즉시 인계됩니다."}
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"📋 *상담사 질문 내용:*\n>{orig_q}"
+                        }
                     },
+                    {"type": "divider"},
                     {
                         "type": "input",
                         "block_id": "reason_block",
-                        "label": {"type": "plain_text", "text": "확인 요청 사유"},
+                        "label": {"type": "plain_text", "text": "인계 사유 및 추가 문의 사항"},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "reason_input",
                             "multiline": True,
-                            "placeholder": {"type": "plain_text", "text": "예: 지식 시트 기준과 금액이 다름 / 예외 케이스 처리 방법 확인 필요 등"}
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "예: 지식 시트 기준과 금액이 다름 / 예외 케이스 처리 방법 확인 필요 / 추가 규정 확인 요청 등"
+                            }
                         }
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": "💡 *안내*: 제출 시 해당 스레드에 관리자 호출 알림이 등록됩니다."
+                            }
+                        ]
                     }
                 ]
             }
+
             try:
                 slack_client.views_open(trigger_id=trigger_id, view=modal_view)
             except Exception as e:
-                print(f"모달 팝업 실패: {e}")
+                print(f"❌ 모달 팝업 오류: {e}")
             return {"status": "ok"}
 
-        # 2) 모달 제출 시 스레드에 알림 게시
+        # B. 모달 팝업 제출(Submit) 시 스레드에 정식 인계 티켓 카드 전송
         elif p_type == "view_submission":
-            user_name = payload.get("user", {}).get("name", "상담사")
+            user_info = payload.get("user", {})
+            user_name = user_info.get("name", "상담사")
+            user_id = user_info.get("id", "")
+            
             meta = json.loads(payload.get("view", {}).get("private_metadata", "{}"))
             channel_id = meta.get("c")
             thread_ts = meta.get("t")
             orig_q = meta.get("q", "")
+            
             reason = payload.get("view", {}).get("state", {}).get("values", {}).get("reason_block", {}).get("reason_input", {}).get("value", "")
 
-            notice_text = (
-                f"🚨 *[관리자(SV) 확인 요청 접수됨]*\n"
-                f"• *요청자*: @{user_name}\n"
-                f"• *질의 요약*: {orig_q}\n"
-                f"• *요청 사유*: {reason}\n\n"
-                f"👉 _관리자(SV) 확인 후 스레드로 안내드릴 예정입니다._"
-            )
+            notice_blocks = [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "🚨 [관리자(SV) 업무 확인 요청]", "emoji": True}
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*요청 상담사:*\n<@{user_id}> ({user_name})"},
+                        {"type": "mrkdwn", "text": f"*상태:*\n검토 대기중 ⏳"}
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*상담사 원본 질문:*\n>{orig_q}"}
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*상세 인계 사유:*\n{reason}"}
+                },
+                {"type": "divider"},
+                {
+                    "type": "context",
+                    "elements": [
+                        {"type": "mrkdwn", "text": "📌 *관리자(SV) 안내*: 검토 후 본 스레드 댓글로 답변 또는 지침을 남겨주세요."}
+                    ]
+                }
+            ]
+
             try:
-                slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=notice_text, mrkdwn=True)
+                slack_client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    blocks=notice_blocks,
+                    text=f"🚨 [관리자 확인 요청] {orig_q}"
+                )
             except Exception as e:
-                print(f"인계 알림 전송 실패: {e}")
+                print(f"❌ 인계 카드 전송 실패: {e}")
+
             return {"response_action": "clear"}
 
-    # B. 일반 슬랙 메시지 이벤트 (application/json)
-    data = await request.json()
+    # 2. 일반 슬랙 메시지 이벤트 (JSON 파싱)
+    try:
+        data = json.loads(body_str)
+    except Exception:
+        return {"status": "ignored"}
+
     if data.get("type") == "url_verification":
         return {"challenge": data.get("challenge")}
 
@@ -290,7 +363,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
         message_ts = event.get("ts")
         thread_ts = event.get("thread_ts")
 
-        # 1) 메인 채널 신규 질문
         if text.startswith("[질의-AI]"):
             question = text.replace("[질의-AI]", "").strip()
             background_tasks.add_task(
@@ -301,7 +373,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
                 question,
                 False
             )
-        # 2) 스레드 내 후속 질문 / 오답 정정 감지
         elif thread_ts and thread_ts != message_ts:
             correction_keywords = ["틀렸", "달라", "아닌", "다시", "확인해", "관리자", "sv", "왜", "어떻게"]
             if any(k in text for k in correction_keywords) or len(text) > 4:
