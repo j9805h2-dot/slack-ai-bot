@@ -70,7 +70,6 @@ sync_master_knowledge()
 
 def search_memory_knowledge(query: str):
     clean_q = re.sub(r"[^\w\s가-힣]", " ", query.lower())
-    # 불용어를 철저히 제거하여 엉뚱한 대납 서류 등이 엮이지 않게 차단
     stop_words = {"서류", "필요", "뭐야", "알려줘", "관련", "대해", "어떻게", "확인", "부탁", "필요한", "서류가"}
     tokens = [t for t in clean_q.split() if len(t) > 1 and t not in stop_words]
 
@@ -82,7 +81,7 @@ def search_memory_knowledge(query: str):
 
         for token in tokens:
             if token in sub_lower:
-                score += 100  # 소분류(귀화, 개명 등) 일치 시 최고 점수
+                score += 100
             if token in q_lower:
                 score += 50
             for kw in item["keywords"]:
@@ -91,20 +90,18 @@ def search_memory_knowledge(query: str):
                 elif token in kw:
                     score += 10
 
-        # 핵심 단어가 매칭된 경우만 수집
         if score >= 30:
             content = f"[{item['category']} > {item['sub']} - {item['question']}]\n{item['answer']}"
             scored.append((score, content))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    # 가장 연관도 높은 단 1~2건만 정확히 타겟팅
     matched_items = [s[1] for s in scored[:2]]
     return "\n\n---\n\n".join(matched_items), len(matched_items) > 0
 
-def call_gemini_api(prompt: str) -> str:
-    """공식 GenAI SDK를 활용하여 확실하게 정제 답변 생성"""
+def call_gemini_api(prompt: str):
+    """(성공여부, 텍스트_또는_에러메시지) 튜플 반환"""
     models = ["gemini-2.5-flash", "gemini-2.0-flash"]
-    last_err = ""
+    last_err = "등록된 GEMINI_API_KEY가 없습니다."
 
     for api_key in GEMINI_API_KEYS:
         try:
@@ -120,16 +117,15 @@ def call_gemini_api(prompt: str) -> str:
                         )
                     )
                     if res and res.text:
-                        return res.text.strip()
+                        return True, res.text.strip()
                 except Exception as inner_e:
-                    last_err = str(inner_e)
+                    last_err = f"[{model_name}] {str(inner_e)}"
                     continue
         except Exception as outer_e:
-            last_err = str(outer_e)
+            last_err = f"[Client Init] {str(outer_e)}"
             continue
 
-    print(f"❌ Gemini 호출 실패 상세: {last_err}")
-    return ""
+    return False, last_err
 
 def build_escalation_blocks(reply_text: str, channel_id: str, thread_ts: str, question: str):
     meta_val = json.dumps({"c": channel_id, "t": thread_ts, "q": question[:80]}, ensure_ascii=False)
@@ -188,29 +184,20 @@ def async_bot_worker(channel_id: str, thread_ts: str, message_ts: str, question:
 
 (※ 규정이 없는 경우 '사내 공식 지식에 미등록된 항목이므로 SV 확인이 필요합니다.' 명시)"""
 
-    ai_reply = call_gemini_api(prompt)
+    success, result_text = call_gemini_api(prompt)
 
     need_button = False
-    if is_direct_escalate or is_correction or not has_match or not ai_reply:
+    if is_direct_escalate or is_correction or not has_match or not success:
         need_button = True
 
-    # 무조건 정제된 텍스트만 전송 (시트 원본 날것 노출 원천 차단)
-    if ai_reply:
-        final_text = ai_reply
-    elif has_match:
-        final_text = (
-            "📢 *[핵심 답변]*:\n"
-            "일시적으로 AI 정제 엔진 연결이 원활하지 않습니다. 아래 사내 공식 규정을 참고해 주세요.\n\n"
-            f"{evidence}\n\n"
-            "📌 *[상담 가이드 & 팁]*:\n"
-            "- 세부 규정 확인이 필요할 경우 관리자 확인을 요청해 주세요."
-        )
+    # 성공 시 정제 답변 출력, 실패 시 실제 원인 에러를 스레드에 그대로 출력
+    if success:
+        final_text = result_text
     else:
         final_text = (
-            "📢 *[핵심 답변]*:\n"
-            "사내 공식 지식에 등록되지 않은 항목입니다.\n\n"
-            "📌 *[상담 가이드 & 팁]*:\n"
-            "- 정확한 안내를 위해 아래 버튼을 눌러 SV(관리자) 확인을 진행해 주세요."
+            f"⚠️ *[Gemini API 호출 오류 발생]*\n"
+            f"• *에러 내용*: `{result_text}`\n\n"
+            f"📢 *[임시 사내 마스터 규정 조회]*:\n{evidence if has_match else '등록된 규정 없음'}"
         )
 
     try:
@@ -245,7 +232,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
     body_bytes = await request.body()
     body_str = body_bytes.decode("utf-8")
 
-    # 1. 관리자 인계 버튼 클릭 및 모달 팝업 상호작용
     if body_str.startswith("payload="):
         parsed = urllib.parse.parse_qs(body_str)
         raw_payload = parsed.get("payload", ["{}"])[0]
@@ -337,7 +323,6 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
             return {"response_action": "clear"}
 
-    # 2. 일반 슬랙 메시지 이벤트
     try:
         data = json.loads(body_str)
     except Exception:
