@@ -175,9 +175,9 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
         print(f"⚠️ 스레드 문맥 조회 예외: {e}")
         return "", "", 1
 
-# 7. 관리자/팀장/SV 질의 의도 감지
+# 7. 관리자 질의 키워드 감지 유틸
 def check_manual_escalation_intent(text: str) -> bool:
-    keywords = ["팀장", "관리자", "sv", "에스브이", "상급자", "물어볼", "물어봐야", "확인해볼", "올려볼", "질의서"]
+    keywords = ["팀장", "관리자", "sv", "에스브이", "상급자", "물어볼", "물어봐야", "물어볼래", "확인해볼", "올려볼", "질의서"]
     normalized = text.lower()
     return any(k in normalized for k in keywords)
 
@@ -198,12 +198,12 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 9. 캡처 이미지와 100% 동일한 모달 UI 뷰 생성
-def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, default_q: str = "") -> dict:
+# 9. 캡처 양식과 100% 동일한 안전한 모달 UI
+def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str) -> dict:
     return {
         "type": "modal",
         "callback_id": "submit_inquiry_modal",
-        "title": {"type": "plain_text", "text": "📋 관리자(SV) 질의 접수"},
+        "title": {"type": "plain_text", "text": "질의 접수"},
         "submit": {"type": "plain_text", "text": "전송"},
         "close": {"type": "plain_text", "text": "취소"},
         "private_metadata": json.dumps({
@@ -228,7 +228,7 @@ def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, defau
                 "element": {
                     "type": "plain_text_input",
                     "action_id": "author_input",
-                    "initial_value": user_name if user_name else "",
+                    "initial_value": user_name if user_name else "상담사",
                     "placeholder": {"type": "plain_text", "text": "성함을 입력하세요."}
                 }
             },
@@ -270,7 +270,6 @@ def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, defau
                     "type": "plain_text_input",
                     "action_id": "myQ_input",
                     "multiline": True,
-                    "initial_value": default_q if default_q else "",
                     "placeholder": {"type": "plain_text", "text": "확인받고자 하는 구체적인 내용 작성"}
                 }
             }
@@ -300,44 +299,43 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     wants_manual_escalate = check_manual_escalation_intent(clean_prompt)
     is_escalation_triggered = (user_q_count >= 3) or wants_manual_escalate
 
-    search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
-    knowledge = search_relevant_knowledge(search_target)
+    # [수정 1] 최초 인입 시 또는 스레드에서 바로 관리자 호출을 명시한 경우 긴 사설 없이 즉시 심플 응답
+    if wants_manual_escalate:
+        answer = "제가 완벽하게 답변드리지 못해 죄송합니다. 다음번엔 더 정확하고 완벽하게 안내해 드릴 수 있도록 노력하겠습니다!\n\n해당 문의는 아래 버튼을 통해 관리자(SV)님께 바로 질의해 주시면 됩니다."
+    elif user_q_count >= 3:
+        # 3회 이상 질문 누적 시 기본 지식 답변 + 하단에 정중하고 간결한 사과 유도문
+        search_target = f"{first_q_clean} {clean_prompt}"
+        knowledge = search_relevant_knowledge(search_target)
+        system_instruction = f"""
+당신은 상담원들을 지원하는 사내 AI 어시스턴트입니다.
+사내 규정 지식을 바탕으로 간결하고 명확하게 핵심만 답변하세요.
+사설이나 장황한 인사/응원은 최소화하세요.
 
-    if is_escalation_triggered:
-        escalation_guide_prompt = """
-*중요 특별 지침 (관리자/팀장/SV 에스컬레이션 모드)*:
-상담원이 질문을 3회 이상 이어가고 있거나, 팀장/관리자/SV 확인을 직접 원하고 있습니다.
-AI가 모든 결론을 단정 짓지 마세요. 
-"해당 문의는 건별 특수 상황이나 예외적인 승인 기준이 필요할 수 있어, AI 지식만으로는 정확한 확인이 어려울 수 있습니다. 상담원님께서 안전하고 정확하게 처리하실 수 있도록 아래 [📋 관리자(SV) 질의 접수] 버튼을 통해 직접 확인해 보시는 것을 권장해 드립니다."라고 안내하세요.
+[사내 규정 지식]:
+{json.dumps(knowledge['master_rules'], ensure_ascii=False, indent=2)}
+
+[질문]:
+{clean_prompt}
 """
+        base_answer = call_gemini_api(system_instruction)
+        answer = f"{base_answer}\n\n---\n*안내*: 제가 명쾌하게 해결해 드리지 못해 죄송합니다. 다음엔 더 완벽히 숙지해 도움드릴 수 있도록 하겠습니다!\n정확한 예외 처리 기준은 아래 버튼을 눌러 관리자(SV)님께 접수해 주시길 권장드립니다."
     else:
-        escalation_guide_prompt = ""
+        # 평상시 일반 질문 답변
+        knowledge = search_relevant_knowledge(clean_prompt)
+        system_instruction = f"""
+당신은 상담원들을 지원하는 사내 AI 어시스턴트입니다.
+사내 규정 지식을 바탕으로 질문에 대해 명확하고 보기 쉽게 정리해 답변하세요.
 
-    system_instruction = f"""
-당신은 상담원들을 지원하는 따뜻하고 상냥한 사내 AI 어시스턴트입니다.
-
-[⚠️ 최우선 검수 보정 지식 (팀장/관리자가 수정한 피드백)]:
-{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}
-*중요*: 피드백이 두서없이 적혀 있더라도 핵심을 추출하여 명확하고 다정한 표준 규정 안내 양식으로 정리하세요.
-
-[사내 마스터 규정 지식 베이스]:
+[사내 규정 지식]:
 {json.dumps(knowledge['master_rules'], ensure_ascii=False, indent=2)}
 
 [이전 대화 맥락]:
 {thread_history if thread_history else "신규 질문입니다."}
 
-[현재 상담원 질문 (스레드 누적 {user_q_count}회차)]:
+[질문]:
 {clean_prompt}
-{escalation_guide_prompt}
-
-[답변 작성 가이드라인]:
-1. 첫 문장은 상담원에게 힘을 주는 따뜻하고 밝은 인사로 시작하세요.
-2. 규정 내용은 핵심 항목별로 이모티콘(📌, ✔️, 💡 등)과 볼드체(*텍스트*)를 사용하여 가독성 높게 정리하세요.
-3. 스레드 연속 대화인 경우 이전 맥락을 이어 자연스럽고 일관되게 설명하세요.
-4. 마무리는 다정하고 힘찬 응원으로 끝맺어 주세요.
 """
-
-    answer = call_gemini_api(system_instruction)
+        answer = call_gemini_api(system_instruction)
 
     if slack_client:
         try:
@@ -345,6 +343,7 @@ AI가 모든 결론을 단정 짓지 마세요.
         except Exception:
             pass
 
+        # 에스컬레이션 트리거 시 버튼 2개 부착
         if is_escalation_triggered:
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
@@ -361,7 +360,7 @@ AI가 모든 결론을 단정 짓지 마세요.
                         },
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "❌ 질의서 작성 안 함 (해결됨)"},
+                            "text": {"type": "plain_text", "text": "❌ 작성 취소 (해결됨)"},
                             "action_id": "dismiss_inquiry_btn",
                             "value": target_ts
                         }
@@ -383,6 +382,7 @@ AI가 모든 결론을 단정 짓지 마세요.
         except Exception as e:
             print(f"❌ 슬랙 전송 실패: {e}")
 
+    # 구글 시트 질의로그 기록
     gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
@@ -419,7 +419,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 모달 제출 후 시트 처리 백그라운드 태스크
+# 12. 모달 제출 후 시트 전송 처리
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -431,7 +431,6 @@ def bg_process_submission(view: dict):
     customer_q = values.get("customerQ_block", {}).get("customerQ_input", {}).get("value", "")
     my_q = values.get("myQ_block", {}).get("myQ_input", {}).get("value", "")
 
-    # Apps Script 엔드포인트 규격과 100% 일치
     sheet_payload = {
         "action": "escalate",
         "team": team,
@@ -455,7 +454,7 @@ def bg_process_submission(view: dict):
             slack_client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=f"✅ *관리자(SV) 질의서가 접수 대장에 등록되었습니다.*\n• *소속:* {team} | *작성자:* {author} | *회원명:* {name}\n• *질의 내용:* {my_q}"
+                text=f"✅ *관리자(SV) 질의서가 접수 대장에 등록되었습니다.*\n• *소속:* {team} | *작성자:* {author} | *회원명:* {name}\n• *질의 요약:* {my_q}"
             )
         except Exception as e:
             print(f"⚠️ 완료 알림 실패: {e}")
@@ -477,29 +476,25 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 action_id = action.get("action_id")
                 raw_val = action.get("value", "")
 
-                # [관리자(SV) 질의 접수] 클릭 시 모달 열기
                 if action_id == "open_inquiry_modal_btn":
                     trigger_id = payload.get("trigger_id")
                     channel_id = payload.get("channel", {}).get("id")
                     user_info = payload.get("user", {})
-                    user_id = user_info.get("id")
-                    user_name = user_info.get("name", "")
+                    user_name = user_info.get("name", "상담사")
 
-                    if slack_client:
-                        try:
-                            u_res = slack_client.users_info(user=user_id)
-                            user_name = u_res.get("user", {}).get("real_name", user_name)
-                        except Exception:
-                            pass
-
+                    if slack_client and trigger_id:
                         modal_view = build_modal_view_dict(channel_id, raw_val, user_name)
-                        api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
-                        if not api_res.get("ok"):
-                            print(f"❌ views.open 실패: {api_res.get('error')}")
+                        try:
+                            api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
+                            if not api_res.get("ok"):
+                                print(f"❌ views.open 실패: {api_res.get('error')}")
+                            else:
+                                print(f"✅ 모달 팝업 성공! (user: {user_name})")
+                        except Exception as e:
+                            print(f"❌ views_open 호출 예외: {e}")
 
                     return Response(status_code=200)
 
-                # [질의서 작성 안 함] 클릭 시
                 elif action_id == "dismiss_inquiry_btn":
                     channel_id = payload.get("channel", {}).get("id")
                     user_id = payload.get("user", {}).get("id")
@@ -508,7 +503,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                             slack_client.chat_postMessage(
                                 channel=channel_id,
                                 thread_ts=raw_val,
-                                text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다. 오늘도 화이팅하세요! ✨"
+                                text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다."
                             )
                         except Exception as e:
                             print(f"⚠️ dismiss 메시지 발송 실패: {e}")
