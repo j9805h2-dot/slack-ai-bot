@@ -10,8 +10,6 @@ import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 # 1. .env 환경변수 로드
 load_dotenv()
@@ -98,16 +96,12 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> list:
     scored_results.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored_results[:top_k]]
 
-# 4. v1 API 엔드포인트 전용 호출 함수 (v1beta 404 방지)
-def call_gemini_sdk(prompt: str) -> str:
+# 4. 검증 완료된 모델(gemini-2.5-flash) 호출 함수
+def call_gemini_api(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
         return "⚠️ 등록된 Gemini API 키가 없습니다. .env 파일을 확인해 주세요."
 
-    max_attempts = len(GEMINI_API_KEYS)
-    last_error_msg = ""
-
-    # REST v1 엔드포인트 직접 호출 (v1beta 404 우회)
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{
@@ -119,39 +113,33 @@ def call_gemini_sdk(prompt: str) -> str:
         }
     }
 
-    # 계정에 따라 호환되는 모델 목록
-    candidate_urls = [
-        "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
-        "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent",
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-    ]
+    max_attempts = len(GEMINI_API_KEYS)
+    last_error_msg = ""
 
     for _ in range(max_attempts):
         current_key = GEMINI_API_KEYS[api_key_index]
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={current_key}"
+        
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=25)
+            if res.status_code == 200:
+                data = res.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                last_error_msg = f"{res.status_code}: {res.text}"
+                print(f"⚠️ Gemini API 응답 에러 [{res.status_code}]: {res.text}")
+        except Exception as e:
+            last_error_msg = str(e)
+            print(f"⚠️ API 통신 실패: {e}")
 
-        for base_url in candidate_urls:
-            try:
-                res = requests.post(
-                    f"{base_url}?key={current_key}",
-                    headers=headers,
-                    json=payload,
-                    timeout=25
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    last_error_msg = f"{res.status_code} {res.text}"
-            except Exception as e:
-                last_error_msg = str(e)
-
+        # 실패 시 다음 키로 교체
         api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
 
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(상세 원인: {last_error_msg[:120]})"
 
-# 5. Slack 비동기 질문 처리 및 이모지 상태 관리
+# 5. Slack 비동기 질문 처리 및 이모지 반응 관리
 def process_slack_question(channel: str, ts: str, user_text: str):
-    # 1) 수신 확인: 질문 원본 메시지에 눈알(👀) 이모지 추가
+    # 1) 질문 확인: 눈알(👀) 이모지 등록
     if slack_client:
         try:
             slack_client.reactions_add(
@@ -183,10 +171,10 @@ def process_slack_question(channel: str, ts: str, user_text: str):
 4. 마무리는 "오늘도 힘찬 하루 보내세요! 추가로 궁금한 점이 있으시면 언제든 편하게 물어보세요. ✨" 같은 다정한 응원으로 끝맺어 주세요.
 """
 
-    answer = call_gemini_sdk(system_instruction)
+    answer = call_gemini_api(system_instruction)
 
     if slack_client:
-        # 2) 답변 완료: 기존 눈알(👀) 이모지 제거
+        # 2) 답변 생성 완료: 눈알(👀) 이모지 삭제
         try:
             slack_client.reactions_remove(
                 channel=channel,
@@ -196,7 +184,7 @@ def process_slack_question(channel: str, ts: str, user_text: str):
         except Exception as e:
             print(f"⚠️ 👀 이모지 삭제 실패: {e}")
 
-        # 3) 스레드에 최종 답변 게시
+        # 3) 스레드에 최종 답변 전송
         try:
             slack_client.chat_postMessage(
                 channel=channel,
