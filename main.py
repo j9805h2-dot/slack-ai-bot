@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 # 1. .env 환경변수 로드
 load_dotenv()
@@ -97,7 +98,7 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> list:
     scored_results.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored_results[:top_k]]
 
-# 4. Google 공식 SDK(genai.Client)를 사용한 키 순환 호출 함수
+# 4. v1 API 엔드포인트 전용 호출 함수 (v1beta 404 방지)
 def call_gemini_sdk(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
@@ -106,26 +107,44 @@ def call_gemini_sdk(prompt: str) -> str:
     max_attempts = len(GEMINI_API_KEYS)
     last_error_msg = ""
 
-    # 지원되는 모델 순서대로 탐색 (2.5 -> 2.0 -> 1.5)
-    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    # REST v1 엔드포인트 직접 호출 (v1beta 404 우회)
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 2048
+        }
+    }
+
+    # 계정에 따라 호환되는 모델 목록
+    candidate_urls = [
+        "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    ]
 
     for _ in range(max_attempts):
         current_key = GEMINI_API_KEYS[api_key_index]
-        client = genai.Client(api_key=current_key)
 
-        for model_name in candidate_models:
+        for base_url in candidate_urls:
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
+                res = requests.post(
+                    f"{base_url}?key={current_key}",
+                    headers=headers,
+                    json=payload,
+                    timeout=25
                 )
-                if response and response.text:
-                    return response.text
+                if res.status_code == 200:
+                    data = res.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    last_error_msg = f"{res.status_code} {res.text}"
             except Exception as e:
                 last_error_msg = str(e)
-                print(f"⚠️ 모델 {model_name} 키({current_key[:8]}...) 호출 실패: {e}")
 
-        # 모든 모델 실패 시 다음 API 키로 전환
         api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
 
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(상세 원인: {last_error_msg[:120]})"
