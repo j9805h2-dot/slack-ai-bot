@@ -80,9 +80,10 @@ refresh_all_knowledge()
 def normalize_text(text: str) -> str:
     return re.sub(r'[\s\-_/&]+', '', text.lower())
 
-def search_relevant_knowledge(query: str, top_k: int = 4) -> dict:
+def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
-    if time.time() - LAST_SYNC_TIME > 600:
+    # 실시간 피드백 즉각 반영을 위해 동기화 간격을 60초로 설정
+    if time.time() - LAST_SYNC_TIME > 60:
         refresh_all_knowledge()
 
     cleaned_query = normalize_text(query)
@@ -198,7 +199,7 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 9. 캡처 양식과 100% 동일한 안전한 모달 UI (user_id 추가)
+# 9. 모달 UI 생성 함수 (user_id 메타데이터 보존)
 def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_id: str) -> dict:
     return {
         "type": "modal",
@@ -301,31 +302,28 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     wants_manual_escalate = check_manual_escalation_intent(clean_prompt)
     is_escalation_triggered = (user_q_count >= 3) or wants_manual_escalate
 
-    # [분기 처리]
+    # 1) 관리자/팀장 직접 호출 시 (사과 없이 당당하고 친절하게 질의서 접수 안내)
     if wants_manual_escalate:
         answer = "관리자(SV)님께 바로 질문하실 수 있도록 접수를 도와드리겠습니다.\n아래 *[📋 관리자(SV) 질의 접수]* 버튼을 눌러 질의서를 작성해 주세요!"
-    elif user_q_count >= 3:
-        search_target = f"{first_q_clean} {clean_prompt}"
-        knowledge = search_relevant_knowledge(search_target)
-        system_instruction = f"""
-당신은 상담원들을 지원하는 사내 AI 어시스턴트입니다.
-사내 규정 지식을 바탕으로 간결하고 명확하게 핵심만 답변하세요.
-
-[사내 규정 지식]:
-{json.dumps(knowledge['master_rules'], ensure_ascii=False, indent=2)}
-
-[질문]:
-{clean_prompt}
-"""
-        base_answer = call_gemini_api(system_instruction)
-        answer = f"{base_answer}\n\n---\n*안내*: 해당 문의는 상황에 따른 세부 확인이 필요할 수 있으니, 아래 버튼을 통해 관리자(SV)님께 직접 질의서를 접수해 보시는 것을 권장해 드립니다."
     else:
-        knowledge = search_relevant_knowledge(clean_prompt)
-        system_instruction = f"""
-당신은 상담원들을 지원하는 사내 AI 어시스턴트입니다.
-사내 규정 지식을 바탕으로 질문에 대해 명확하고 보기 쉽게 정리해 답변하세요.
+        # 2) 규정 지식 검색 (마스터 규정 + 시트 실시간 보정 지식)
+        search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
+        knowledge = search_relevant_knowledge(search_target)
 
-[사내 규정 지식]:
+        corrected_context = ""
+        if knowledge.get('corrected_rules'):
+            corrected_context = f"""
+[⚠️ 관리자 최우선 보정 지침 - 기존 마스터 규정보다 아래 내용을 무조건 최우선 적용할 것]:
+{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}
+"""
+
+        system_instruction = f"""
+당신은 보람상조 양평센터 상담원들을 지원하는 사내 AI 어시스턴트입니다.
+사내 규정 지식과 관리자 보정 지침을 바탕으로 실무적이고 명확하게 답변하세요.
+
+{corrected_context}
+
+[기본 사내 규정 지식]:
 {json.dumps(knowledge['master_rules'], ensure_ascii=False, indent=2)}
 
 [이전 대화 맥락]:
@@ -333,8 +331,20 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
 [질문]:
 {clean_prompt}
+
+[답변 작성 원칙]:
+1. [⚠️ 관리자 최우선 보정 지침]에 기재된 피드백이나 보정 내용이 있다면 기존 규정보다 무조건 1순위로 채택하여 답변하세요.
+2. 질문에 '프로세스', '절차', '순서', '방법', '단계' 등의 키워드가 포함된 경우:
+   - 반드시 **실무자가 취해야 할 단계별 진행 순서(1단계 ➔ 2단계 ➔ 3단계...)**를 최우선으로 명확히 제시하세요.
+   - 혜택 중단/복구, 약관 조항, 환급금 주의사항 등은 단계별 프로세스 하단에 **[참고 및 고객 안내 사항]** 형태로 구분하여 보조 정보로 제공하세요.
+3. 상담사가 고객과 통화 중 바로 참고할 수 있도록 군더더기 서론은 배제하고 불릿 포인트와 볼드체를 활용해 핵심만 간결하게 작성하세요.
 """
-        answer = call_gemini_api(system_instruction)
+        base_answer = call_gemini_api(system_instruction)
+
+        if user_q_count >= 3:
+            answer = f"{base_answer}\n\n---\n*안내*: 해당 문의는 상황에 따른 세부 확인이 필요할 수 있으니, 아래 버튼을 통해 관리자(SV)님께 직접 질의서를 접수해 보시는 것을 권장해 드립니다."
+        else:
+            answer = base_answer
 
     if slack_client:
         try:
@@ -416,7 +426,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 모달 제출 후 시트 전송 처리 (작성자 슬랙 멘션 포맷 적용)
+# 12. 모달 제출 후 시트 전송 처리 (E열 작성자에 멘션 태그 포맷 적용)
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -432,7 +442,7 @@ def bg_process_submission(view: dict):
     thread_ts = meta.get("thread_ts")
     user_id = meta.get("user_id", "")
 
-    # 앱스크립트 수정 없이 슬랙 멘션이 걸리도록 <@USER_ID> 형태로 시트의 작성자(E열)에 전송
+    # 앱스크립트 수정 없이 시트 E열(작성자)을 읽어 슬랙 멘션을 쏠 수 있도록 <@USER_ID> 형태로 전달
     author_val = f"<@{user_id}>" if user_id else author_text
 
     sheet_payload = {
@@ -495,7 +505,6 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                         except Exception as e:
                             print(f"⚠️ users_info 조회 예외: {e}")
 
-                        # user_id 함께 전달
                         modal_view = build_modal_view_dict(channel_id, raw_val, user_name, user_id)
                         try:
                             api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
