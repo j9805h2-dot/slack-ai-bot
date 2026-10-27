@@ -11,26 +11,25 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 
-# .env 환경변수 로드
+# 1. .env 환경변수 로드
 load_dotenv()
 
 app = FastAPI()
 
-# 1. 환경변수 로드 및 API 키 수집
+# 2. Slack 클라이언트 및 API 키 로드
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 
 GEMINI_API_KEYS = []
 for k, v in os.environ.items():
     if k.startswith("GEMINI_API_KEY") and v.strip():
-        # 따옴표가 남아있을 경우 제거
         clean_key = v.strip().strip('"').strip("'")
         GEMINI_API_KEYS.append(clean_key)
 
 api_key_index = 0
 print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 
-# 2. 구글 스프레드시트 마스터 지식 베이스
+# 3. 구글 스프레드시트 마스터 지식 베이스 캐싱
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv"
 
@@ -38,6 +37,7 @@ KNOWLEDGE_CACHE = []
 LAST_SYNC_TIME = 0
 
 def fetch_knowledge_base():
+    """구글 시트 CSV를 파싱하여 전역 캐시에 적재"""
     global KNOWLEDGE_CACHE, LAST_SYNC_TIME
     try:
         res = requests.get(SHEET_CSV_URL, timeout=10)
@@ -66,10 +66,12 @@ def fetch_knowledge_base():
 fetch_knowledge_base()
 
 def normalize_text(text: str) -> str:
+    """특수문자 및 공백 제거를 통한 색인율 향상"""
     text = text.lower()
     return re.sub(r'[\s\-_/&]+', '', text)
 
 def search_relevant_knowledge(query: str, top_k: int = 5) -> list:
+    """사용자 질의 기반 연관 지식 검색"""
     global KNOWLEDGE_CACHE, LAST_SYNC_TIME
     if time.time() - LAST_SYNC_TIME > 3600:
         fetch_knowledge_base()
@@ -94,13 +96,13 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> list:
     scored_results.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored_results[:top_k]]
 
-# 3. Gemini 호출 함수 (표준 엔드포인트 및 상세 로깅)
+# 4. Gemini REST API 순환 호출 함수
 def call_gemini_api_rest(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
         return "⚠️ 등록된 Gemini API 키가 없습니다. .env 파일을 확인해 주세요."
 
-    # 안정적인 Gemini 1.5 Flash 공식 엔드포인트
+    # 공식 표준 엔드포인트
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
     payload = {
@@ -114,6 +116,8 @@ def call_gemini_api_rest(prompt: str) -> str:
     }
 
     max_attempts = len(GEMINI_API_KEYS)
+    last_error_msg = ""
+
     for _ in range(max_attempts):
         current_key = GEMINI_API_KEYS[api_key_index]
         req_url = f"{url}?key={current_key}"
@@ -124,17 +128,20 @@ def call_gemini_api_rest(prompt: str) -> str:
                 data = res.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"]
             else:
+                last_error_msg = f"HTTP {res.status_code}: {res.text}"
                 print(f"⚠️ Gemini API 응답 에러 [{res.status_code}]: {res.text}")
         except Exception as e:
+            last_error_msg = str(e)
             print(f"⚠️ 키 호출 통신 실패: {e}")
 
+        # 다음 키로 로테이션
         api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
 
-    return "죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다. 잠시 후 다시 시도해 주세요."
+    return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(상세 원인: {last_error_msg[:120]})"
 
-# 4. 슬랙 질문 처리 및 이모지 반응
+# 5. Slack 비동기 질문 처리 및 이모지 상태 관리
 def process_slack_question(channel: str, ts: str, user_text: str):
-    # 1) 질문 확인 이모지 (👀) 추가
+    # 1) 수신 확인: 질문 원본 메시지에 눈알(👀) 이모지 추가
     if slack_client:
         try:
             slack_client.reactions_add(
@@ -143,7 +150,7 @@ def process_slack_question(channel: str, ts: str, user_text: str):
                 name="eyes"
             )
         except Exception as e:
-            print(f"⚠️ 이모지 추가 실패: {e}")
+            print(f"⚠️ 👀 이모지 추가 실패: {e}")
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
     matched_docs = search_relevant_knowledge(clean_prompt, top_k=4)
@@ -168,15 +175,25 @@ def process_slack_question(channel: str, ts: str, user_text: str):
 
     answer = call_gemini_api_rest(system_instruction)
 
-    # 2) 답변 전송
     if slack_client:
+        # 2) 답변 완료: 기존 눈알(👀) 이모지 삭제
+        try:
+            slack_client.reactions_remove(
+                channel=channel,
+                timestamp=ts,
+                name="eyes"
+            )
+        except Exception as e:
+            print(f"⚠️ 👀 이모지 삭제 실패: {e}")
+
+        # 3) 스레드에 최종 답변 전송
         try:
             slack_client.chat_postMessage(
                 channel=channel,
                 thread_ts=ts,
                 text=answer
             )
-            # 3) 완료 이모지 (white_check_mark) 추가
+            # 4) 완료 체크(✅) 이모지 추가
             slack_client.reactions_add(
                 channel=channel,
                 timestamp=ts,
@@ -185,6 +202,7 @@ def process_slack_question(channel: str, ts: str, user_text: str):
         except Exception as e:
             print(f"❌ 슬랙 메시지 발송 실패: {e}")
 
+# 6. Slack Events 엔드포인트
 PROCESSED_EVENT_IDS = OrderedDict()
 
 @app.post("/slack/events")
@@ -192,9 +210,11 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     data = json.loads(body.decode("utf-8"))
 
+    # Slack URL 확인 챌린지
     if "challenge" in data:
         return {"challenge": data["challenge"]}
 
+    # 중복 이벤트 수신 방지
     event_id = data.get("event_id")
     if event_id:
         if event_id in PROCESSED_EVENT_IDS:
@@ -209,6 +229,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     ts = event.get("ts")
     bot_id = event.get("bot_id")
 
+    # 봇 본인의 메시지 제외 및 질의 접두어 필터링
     if not bot_id and text.startswith("[질의-AI]"):
         background_tasks.add_task(process_slack_question, channel, ts, text)
 
