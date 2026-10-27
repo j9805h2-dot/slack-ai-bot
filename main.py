@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 
-# .env 환경변수 파일 자동 로드
+# .env 환경변수 로드
 load_dotenv()
 
 app = FastAPI()
@@ -20,14 +20,14 @@ app = FastAPI()
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 
-# 다중 Gemini API 키 로드 (GEMINI_API_KEY_1, GEMINI_API_KEY_2 등 자동 탐색)
 GEMINI_API_KEYS = []
 for k, v in os.environ.items():
     if k.startswith("GEMINI_API_KEY") and v.strip():
-        GEMINI_API_KEYS.append(v.strip())
+        # 따옴표가 남아있을 경우 제거
+        clean_key = v.strip().strip('"').strip("'")
+        GEMINI_API_KEYS.append(clean_key)
 
 api_key_index = 0
-
 print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 
 # 2. 구글 스프레드시트 마스터 지식 베이스
@@ -38,7 +38,6 @@ KNOWLEDGE_CACHE = []
 LAST_SYNC_TIME = 0
 
 def fetch_knowledge_base():
-    """구글 시트 CSV를 파싱하여 전역 캐시에 적재"""
     global KNOWLEDGE_CACHE, LAST_SYNC_TIME
     try:
         res = requests.get(SHEET_CSV_URL, timeout=10)
@@ -47,9 +46,7 @@ def fetch_knowledge_base():
         
         csv_reader = csv.reader(io.StringIO(res.text))
         rows = list(csv_reader)
-        
         if not rows:
-            print("⚠️ 구글 시트 데이터가 비어 있습니다.")
             return
 
         header = rows[0]
@@ -57,10 +54,7 @@ def fetch_knowledge_base():
         for row in rows[1:]:
             if not any(row):
                 continue
-            entry = {}
-            for idx, col_name in enumerate(header):
-                val = row[idx].strip() if idx < len(row) else ""
-                entry[col_name.strip()] = val
+            entry = {header[i].strip(): row[i].strip() for i in range(min(len(header), len(row)))}
             parsed_data.append(entry)
             
         KNOWLEDGE_CACHE = parsed_data
@@ -69,20 +63,14 @@ def fetch_knowledge_base():
     except Exception as e:
         print(f"❌ 마스터 지식 로드 실패: {e}")
 
-# 서버 시작 시 1회 지식 적재
 fetch_knowledge_base()
 
-# 3. 텍스트 정규화 및 키워드 검색 함수
 def normalize_text(text: str) -> str:
-    """특수문자 및 공백을 정규화하여 색인율을 높임"""
     text = text.lower()
-    text = re.sub(r'[\s\-_/&]+', '', text)
-    return text
+    return re.sub(r'[\s\-_/&]+', '', text)
 
 def search_relevant_knowledge(query: str, top_k: int = 5) -> list:
-    """사용자 질의와 연관된 지식을 우선순위로 검색"""
     global KNOWLEDGE_CACHE, LAST_SYNC_TIME
-    # 캐시 유효기간(1시간) 만료 시 갱신
     if time.time() - LAST_SYNC_TIME > 3600:
         fetch_knowledge_base()
         
@@ -95,30 +83,25 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> list:
         item_str = " ".join(item.values())
         norm_item_str = normalize_text(item_str)
         
-        # 완전 일치 가산점
         if cleaned_query in norm_item_str:
             score += 10
-            
-        # 개별 토큰 일치 가산점
         for token in tokens:
             if normalize_text(token) in norm_item_str:
                 score += 3
-                
         if score > 0:
             scored_results.append((score, item))
             
-    # 점수 높은 순 정렬
     scored_results.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored_results[:top_k]]
 
-# 4. Gemini REST API 순환 호출 함수
+# 3. Gemini 호출 함수 (표준 엔드포인트 및 상세 로깅)
 def call_gemini_api_rest(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
         return "⚠️ 등록된 Gemini API 키가 없습니다. .env 파일을 확인해 주세요."
 
-    # Gemini 2.5 Flash 엔드포인트
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    # 안정적인 Gemini 1.5 Flash 공식 엔드포인트
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{
@@ -141,21 +124,28 @@ def call_gemini_api_rest(prompt: str) -> str:
                 data = res.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"]
             else:
-                print(f"⚠️ 키 호출 오류 ({res.status_code}): 다음 키로 전환합니다.")
+                print(f"⚠️ Gemini API 응답 에러 [{res.status_code}]: {res.text}")
         except Exception as e:
-            print(f"⚠️ 키 호출 실패 ({e}): 다음 키로 전환합니다.")
+            print(f"⚠️ 키 호출 통신 실패: {e}")
 
-        # 키 순환
         api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
 
     return "죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다. 잠시 후 다시 시도해 주세요."
 
-# 5. 비동기 질문 처리 및 Slack 메시지 전송
+# 4. 슬랙 질문 처리 및 이모지 반응
 def process_slack_question(channel: str, ts: str, user_text: str):
-    # 접두어 제거
+    # 1) 질문 확인 이모지 (👀) 추가
+    if slack_client:
+        try:
+            slack_client.reactions_add(
+                channel=channel,
+                timestamp=ts,
+                name="eyes"
+            )
+        except Exception as e:
+            print(f"⚠️ 이모지 추가 실패: {e}")
+
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
-    
-    # 지식 베이스 검색
     matched_docs = search_relevant_knowledge(clean_prompt, top_k=4)
     context_str = json.dumps(matched_docs, ensure_ascii=False, indent=2) if matched_docs else "일치하는 규정 데이터 없음"
 
@@ -171,13 +161,14 @@ def process_slack_question(channel: str, ts: str, user_text: str):
 
 [답변 작성 가이드라인]:
 1. 첫 문장은 상담원에게 힘을 주는 따뜻하고 밝은 인사로 시작해 주세요. (예: "안녕하세요, 상담원님! 문의주신 내용 안내해 드릴게요. 😊")
-2. 규정 내용은 핵심 항목별로 이모티콘(📌, ✔️, 💡 등)과 볼드체(`*텍스트*`)를 사용하여 가독성 높게 정리하세요.
+2. 규정 내용은 핵심 항목별로 이모티콘(📌, ✔️, 💡 등)과 볼드체(*텍스트*)를 사용하여 가독성 높게 정리하세요.
 3. 지식 베이스에 없는 내용일 경우 지어내지 말고, "해당 내용은 현재 규정집에 기재되어 있지 않아 담당 부서 확인이 필요합니다."라고 솔직하게 안내하세요.
 4. 마무리는 "오늘도 힘찬 하루 보내세요! 추가로 궁금한 점이 있으시면 언제든 편하게 물어보세요. ✨" 같은 다정한 응원으로 끝맺어 주세요.
 """
 
     answer = call_gemini_api_rest(system_instruction)
 
+    # 2) 답변 전송
     if slack_client:
         try:
             slack_client.chat_postMessage(
@@ -185,10 +176,15 @@ def process_slack_question(channel: str, ts: str, user_text: str):
                 thread_ts=ts,
                 text=answer
             )
+            # 3) 완료 이모지 (white_check_mark) 추가
+            slack_client.reactions_add(
+                channel=channel,
+                timestamp=ts,
+                name="white_check_mark"
+            )
         except Exception as e:
             print(f"❌ 슬랙 메시지 발송 실패: {e}")
 
-# 6. Slack Events 수신 엔드포인트
 PROCESSED_EVENT_IDS = OrderedDict()
 
 @app.post("/slack/events")
@@ -196,11 +192,9 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     data = json.loads(body.decode("utf-8"))
 
-    # 1) Slack URL 검증 (Challenge)
     if "challenge" in data:
         return {"challenge": data["challenge"]}
 
-    # 2) 이벤트 중복 수신 방지
     event_id = data.get("event_id")
     if event_id:
         if event_id in PROCESSED_EVENT_IDS:
@@ -209,14 +203,12 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
         if len(PROCESSED_EVENT_IDS) > 1000:
             PROCESSED_EVENT_IDS.popitem(last=False)
 
-    # 3) 메시지 처리
     event = data.get("event", {})
     text = event.get("text", "")
     channel = event.get("channel")
     ts = event.get("ts")
     bot_id = event.get("bot_id")
 
-    # 봇 본인이 쓴 글 제외 및 [질의-AI] 포함 여부 확인
     if not bot_id and text.startswith("[질의-AI]"):
         background_tasks.add_task(process_slack_question, channel, ts, text)
 
