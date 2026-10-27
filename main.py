@@ -96,7 +96,7 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> list:
     scored_results.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored_results[:top_k]]
 
-# 4. 검증 완료된 모델(gemini-2.5-flash) 호출 함수
+# 4. 현재 계정 가용 모델 순차 호출 함수
 def call_gemini_api(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
@@ -113,26 +113,34 @@ def call_gemini_api(prompt: str) -> str:
         }
     }
 
+    # 현재 목록에서 검증된 활성 모델 우선순위
+    active_models = [
+        "gemini-flash-latest",
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash",
+        "gemini-pro-latest"
+    ]
+
     max_attempts = len(GEMINI_API_KEYS)
     last_error_msg = ""
 
     for _ in range(max_attempts):
         current_key = GEMINI_API_KEYS[api_key_index]
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={current_key}"
-        
-        try:
-            res = requests.post(url, headers=headers, json=payload, timeout=25)
-            if res.status_code == 200:
-                data = res.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                last_error_msg = f"{res.status_code}: {res.text}"
-                print(f"⚠️ Gemini API 응답 에러 [{res.status_code}]: {res.text}")
-        except Exception as e:
-            last_error_msg = str(e)
-            print(f"⚠️ API 통신 실패: {e}")
 
-        # 실패 시 다음 키로 교체
+        for model in active_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}"
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=25)
+                if res.status_code == 200:
+                    data = res.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    last_error_msg = f"{model} ({res.status_code}): {res.text}"
+                    print(f"⚠️ {model} 호출 에러: {res.text}")
+            except Exception as e:
+                last_error_msg = f"{model} 통신 실패: {e}"
+
+        # 다음 API 키로 전환
         api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
 
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(상세 원인: {last_error_msg[:120]})"
