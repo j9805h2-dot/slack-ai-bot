@@ -198,8 +198,8 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 9. 캡처 양식과 100% 동일한 안전한 모달 UI
-def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str) -> dict:
+# 9. 캡처 양식과 100% 동일한 안전한 모달 UI (user_id 추가)
+def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_id: str) -> dict:
     return {
         "type": "modal",
         "callback_id": "submit_inquiry_modal",
@@ -208,7 +208,9 @@ def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str) -> di
         "close": {"type": "plain_text", "text": "취소"},
         "private_metadata": json.dumps({
             "channel_id": channel_id,
-            "thread_ts": thread_ts
+            "thread_ts": thread_ts,
+            "user_id": user_id,
+            "user_name": user_name
         }),
         "blocks": [
             {
@@ -299,12 +301,10 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     wants_manual_escalate = check_manual_escalation_intent(clean_prompt)
     is_escalation_triggered = (user_q_count >= 3) or wants_manual_escalate
 
-    # [핵심 분기 수정]
+    # [분기 처리]
     if wants_manual_escalate:
-        # 사용자가 관리자/팀장/SV에게 질문하겠다고 직접 요청한 경우 (사과 없이 당당하고 친절하게 안내)
         answer = "관리자(SV)님께 바로 질문하실 수 있도록 접수를 도와드리겠습니다.\n아래 *[📋 관리자(SV) 질의 접수]* 버튼을 눌러 질의서를 작성해 주세요!"
     elif user_q_count >= 3:
-        # 질문이 3회 이상 지속된 경우에만 기본 답변 + 정중한 관리자 접수 유도
         search_target = f"{first_q_clean} {clean_prompt}"
         knowledge = search_relevant_knowledge(search_target)
         system_instruction = f"""
@@ -320,7 +320,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         base_answer = call_gemini_api(system_instruction)
         answer = f"{base_answer}\n\n---\n*안내*: 해당 문의는 상황에 따른 세부 확인이 필요할 수 있으니, 아래 버튼을 통해 관리자(SV)님께 직접 질의서를 접수해 보시는 것을 권장해 드립니다."
     else:
-        # 1~2회차 일반 규정 질문 답변
         knowledge = search_relevant_knowledge(clean_prompt)
         system_instruction = f"""
 당신은 상담원들을 지원하는 사내 AI 어시스턴트입니다.
@@ -343,7 +342,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception:
             pass
 
-        # 에스컬레이션 트리거 시 버튼 2개 부착
         if is_escalation_triggered:
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
@@ -382,7 +380,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception as e:
             print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 구글 시트 질의로그 기록
     gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
@@ -419,13 +416,13 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 모달 제출 후 시트 전송 처리 (Q열용 슬랙 스레드 키값 포함)
+# 12. 모달 제출 후 시트 전송 처리 (작성자 슬랙 멘션 포맷 적용)
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
 
     team = values.get("team_block", {}).get("team_input", {}).get("value", "")
-    author = values.get("author_block", {}).get("author_input", {}).get("value", "")
+    author_text = values.get("author_block", {}).get("author_input", {}).get("value", "")
     contract = values.get("contract_block", {}).get("contract_input", {}).get("value", "")
     name = values.get("name_block", {}).get("name_input", {}).get("value", "")
     customer_q = values.get("customerQ_block", {}).get("customerQ_input", {}).get("value", "")
@@ -433,17 +430,20 @@ def bg_process_submission(view: dict):
 
     channel_id = meta.get("channel_id")
     thread_ts = meta.get("thread_ts")
-    slack_thread_key = f"{channel_id}|{thread_ts}"
+    user_id = meta.get("user_id", "")
+
+    # 앱스크립트 수정 없이 슬랙 멘션이 걸리도록 <@USER_ID> 형태로 시트의 작성자(E열)에 전송
+    author_val = f"<@{user_id}>" if user_id else author_text
 
     sheet_payload = {
         "action": "escalate",
         "team": team,
-        "author": author,
+        "author": author_val,
         "contract": contract,
         "name": name,
         "customerQ": customer_q,
         "myQ": my_q,
-        "slack_thread_key": slack_thread_key
+        "slack_thread_key": f"{channel_id}|{thread_ts}"
     }
 
     if LOG_WEBHOOK_URL:
@@ -495,13 +495,14 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                         except Exception as e:
                             print(f"⚠️ users_info 조회 예외: {e}")
 
-                        modal_view = build_modal_view_dict(channel_id, raw_val, user_name)
+                        # user_id 함께 전달
+                        modal_view = build_modal_view_dict(channel_id, raw_val, user_name, user_id)
                         try:
                             api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
                             if not api_res.get("ok"):
                                 print(f"❌ views.open 실패: {api_res.get('error')}")
                             else:
-                                print(f"✅ 모달 팝업 성공! (실명: {user_name})")
+                                print(f"✅ 모달 팝업 성공! (실명: {user_name}, ID: {user_id})")
                         except Exception as e:
                             print(f"❌ views_open 호출 예외: {e}")
 
