@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import JSONResponse, Response
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 
@@ -197,16 +198,16 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 9. 팀장 질의서 모달 UI 생성
-def create_inquiry_modal(trigger_id: str, channel_id: str, thread_ts: str, user_name: str, default_q: str = ""):
+# 9. 팀장 질의서 모달 UI 생성 (Slack 공식 규격 24자 제한 준수)
+def create_inquiry_modal(trigger_id: str, channel_id: str, thread_ts: str, user_name: str):
     return {
         "trigger_id": trigger_id,
         "view": {
             "type": "modal",
             "callback_id": "submit_inquiry_modal",
-            "title": {"type": "plain_text", "text": "📋 팀장 질의서 접수"},
-            "submit": {"type": "plain_text", "text": "접수 제출"},
-            "close": {"type": "plain_text", "text": "취소"},
+            "title": {"type": "plain_text", "text": "팀장 질의서 접수"},  # 24자 이내 준수
+            "submit": {"type": "plain_text", "text": "제출하기"},
+            "close": {"type": "plain_text", "text": "닫기"},
             "private_metadata": json.dumps({
                 "channel_id": channel_id,
                 "thread_ts": thread_ts,
@@ -217,7 +218,7 @@ def create_inquiry_modal(trigger_id: str, channel_id: str, thread_ts: str, user_
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"👤 *작성자:* {user_name} (자동 등록)\n📌 제출 시 *양평센터 질의 접수 및 처리 현황 관리 대장*으로 즉시 이관됩니다."
+                        "text": f"👤 *작성자:* {user_name}\n📌 제출 시 *양평센터 질의 대장*에 실시간으로 등록됩니다."
                     }
                 },
                 {"type": "divider"},
@@ -278,7 +279,6 @@ def create_inquiry_modal(trigger_id: str, channel_id: str, thread_ts: str, user_
                         "type": "plain_text_input",
                         "action_id": "counselor_inquiry_input",
                         "multiline": True,
-                        "initial_value": default_q if default_q else "",
                         "placeholder": {"type": "plain_text", "text": "팀장님께 확인받고자 하는 구체적인 처리 기준"}
                     }
                 }
@@ -306,20 +306,19 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     else:
         first_q_clean = clean_prompt
 
-    # 에스컬레이션 조건 판별: (3회 이상 질문 지속) OR (상담사가 팀장/관리자/SV 직접 확인 의사 표명)
+    # 에스컬레이션 조건: (3회 이상 질문 지속) OR (상담사가 팀장/관리자/SV 직접 확인 의사 표명)
     wants_manual_escalate = check_manual_escalation_intent(clean_prompt)
     is_escalation_triggered = (user_q_count >= 3) or wants_manual_escalate
 
     search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
     knowledge = search_relevant_knowledge(search_target)
 
-    # 에스컬레이션 조건 발동 시의 특별 프롬프트
     if is_escalation_triggered:
         escalation_guide_prompt = """
-*중요 특별 지침 (관리자/팀장 에스컬레이션 모드)*:
-상담원이 3회 이상 질문을 거듭하고 있거나, 팀장/관리자/SV 확인을 직접 희망하고 있습니다.
-AI가 모든 것을 단정 지어 결론 내리지 마세요. 
-"해당 문의는 건별 특수 상황이나 예외 승인 기준이 필요할 수 있어, AI 지식만으로는 정확한 확인이 어려울 수 있습니다. 상담원님께서 안전하고 정확하게 처리하실 수 있도록 아래 [📋 팀장 질의서 작성]을 통해 팀장님(관리자님)께 직접 확인해 보시는 것을 권장해 드립니다."라고 안내하고 팀장 질의서 작성을 적극 유도하세요.
+*중요 특별 지침 (팀장/관리자 에스컬레이션 모드)*:
+상담원이 질문을 3회 이상 이어가고 있거나, 팀장/관리자/SV 확인을 직접 원하고 있습니다.
+AI가 모든 결론을 단정 짓지 마세요. 
+"해당 문의는 특수 상황이나 예외적인 승인 기준이 필요할 수 있어, AI 지식만으로는 정확한 확인이 어려울 수 있습니다. 상담원님께서 안전하게 처리하실 수 있도록 아래 [📋 팀장 질의서 작성]을 통해 팀장님께 직접 확인해 보시는 것을 권장해 드립니다."라고 안내하세요.
 """
     else:
         escalation_guide_prompt = ""
@@ -356,7 +355,7 @@ AI가 모든 것을 단정 지어 결론 내리지 마세요.
         except Exception:
             pass
 
-        # 에스컬레이션 조건일 때만 버튼 블록 첨부
+        # 에스컬레이션 조건일 때만 버튼 블록 2종 첨부
         if is_escalation_triggered:
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
@@ -382,7 +381,6 @@ AI가 모든 것을 단정 지어 결론 내리지 마세요.
             ]
             post_kwargs = {"blocks": blocks}
         else:
-            # 평상시에는 버튼 없이 텍스트 답변만 깔끔하게 전송
             post_kwargs = {}
 
         try:
@@ -396,7 +394,7 @@ AI가 모든 것을 단정 지어 결론 내리지 마세요.
         except Exception as e:
             print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 구글 시트에 질의로그 기록
+    # 구글 시트에 질의로그 저장
     gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
@@ -433,12 +431,16 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. Slack Interactivity 엔드포인트 (모달 및 액션 핸들러)
+# 12. Slack Interactivity 엔드포인트 (오류 방어 & HTTP 200 즉시 반환)
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request):
     try:
         form_data = await request.form()
-        payload = json.loads(form_data.get("payload"))
+        payload_raw = form_data.get("payload")
+        if not payload_raw:
+            return Response(status_code=200)
+
+        payload = json.loads(payload_raw)
 
         # 1) 버튼 클릭
         if payload.get("type") == "block_actions":
@@ -446,7 +448,7 @@ async def slack_interactive(request: Request):
                 action_id = action.get("action_id")
                 raw_val = action.get("value", "")
 
-                # [팀장 질의서 작성] 클릭 시
+                # [팀장 질의서 작성] 클릭
                 if action_id == "open_inquiry_modal_btn":
                     trigger_id = payload.get("trigger_id")
                     channel_id = payload.get("channel", {}).get("id")
@@ -454,41 +456,38 @@ async def slack_interactive(request: Request):
                     user_id = user_info.get("id")
 
                     thread_ts = raw_val
-                    default_q = ""
-                    if "{" in raw_val and "}" in raw_val:
-                        try:
-                            parsed_val = json.loads(raw_val)
-                            thread_ts = parsed_val.get("thread_ts", raw_val)
-                            default_q = parsed_val.get("last_q", "")
-                        except Exception:
-                            pass
-
                     user_name = user_info.get("name", "상담사")
+
                     if slack_client:
                         try:
                             u_res = slack_client.users_info(user=user_id)
                             user_name = u_res.get("user", {}).get("real_name", user_name)
                         except Exception as e:
-                            print(f"⚠️ users_info 조회 생략: {e}")
+                            print(f"⚠️ users_info 생략: {e}")
 
-                    modal_payload = create_inquiry_modal(trigger_id, channel_id, thread_ts, user_name, default_q)
-                    if slack_client:
-                        slack_client.views_open(**modal_payload)
-                    return {"status": "ok"}
+                        modal_payload = create_inquiry_modal(trigger_id, channel_id, thread_ts, user_name)
+                        api_res = slack_client.views_open(**modal_payload)
+                        if not api_res.get("ok"):
+                            print(f"❌ views.open 실패: {api_res.get('error')}")
 
-                # [질의서 작성 안 함] 클릭 시
+                    return Response(status_code=200)
+
+                # [질의서 작성 안 함] 클릭
                 elif action_id == "dismiss_inquiry_btn":
                     channel_id = payload.get("channel", {}).get("id")
                     thread_ts = raw_val
                     user_id = payload.get("user", {}).get("id")
 
                     if slack_client:
-                        slack_client.chat_postMessage(
-                            channel=channel_id,
-                            thread_ts=thread_ts,
-                            text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다. 오늘도 좋은 하루 보내세요! ✨"
-                        )
-                    return {"status": "ok"}
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=channel_id,
+                                thread_ts=thread_ts,
+                                text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다. 오늘도 화이팅하세요! ✨"
+                            )
+                        except Exception as e:
+                            print(f"⚠️ dismiss 메시지 발송 실패: {e}")
+                    return Response(status_code=200)
 
         # 2) 모달 제출 시 처리
         if payload.get("type") == "view_submission":
@@ -514,24 +513,28 @@ async def slack_interactive(request: Request):
                     "myQ": my_q
                 }
 
-                try:
-                    requests.post(LOG_WEBHOOK_URL, json=sheet_payload, timeout=5)
-                except Exception as e:
-                    print(f"⚠️ 대장 전송 실패: {e}")
+                if LOG_WEBHOOK_URL:
+                    try:
+                        requests.post(LOG_WEBHOOK_URL, json=sheet_payload, timeout=5)
+                    except Exception as e:
+                        print(f"⚠️ 시트 전송 실패: {e}")
 
                 channel_id = meta.get("channel_id")
                 thread_ts = meta.get("thread_ts")
-                if slack_client:
-                    slack_client.chat_postMessage(
-                        channel=channel_id,
-                        thread_ts=thread_ts,
-                        text=f"✅ *팀장 질의서가 양평센터 대장에 정식 등록되었습니다.*\n• *소속:* {team} | *회원명:* {customer_name}\n• *질의 요약:* {my_q}"
-                    )
+                if slack_client and channel_id and thread_ts:
+                    try:
+                        slack_client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=thread_ts,
+                            text=f"✅ *팀장 질의서가 양평센터 대장에 등록되었습니다.*\n• *소속:* {team} | *회원명:* {customer_name}\n• *질의 요약:* {my_q}"
+                        )
+                    except Exception as e:
+                        print(f"⚠️ 완료 알림 실패: {e}")
 
-                return {"response_action": "clear"}
+                return JSONResponse(content={"response_action": "clear"})
 
     except Exception as err:
-        print(f"❌ interactive 처리 에러: {err}")
-        return {"status": "error", "message": str(err)}
+        print(f"❌ interactive 처리 예외: {err}")
+        return Response(status_code=200)
 
-    return {"status": "ok"}
+    return Response(status_code=200)
