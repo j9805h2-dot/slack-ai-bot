@@ -174,7 +174,13 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
         print(f"⚠️ 스레드 문맥 조회 예외: {e}")
         return "", "", 1
 
-# 7. 질의로그 시트 전송
+# 7. 관리자 질의 키워드 감지 유틸
+def check_manual_escalation_intent(text: str) -> bool:
+    keywords = ["팀장", "관리자", "sv", "에스브이", "상급자", "물어볼", "물어봐야", "확인해볼", "올려볼", "질의서"]
+    normalized = text.lower()
+    return any(k in normalized for k in keywords)
+
+# 8. 질의로그 시트 전송
 def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, sub_q: str, answer: str):
     if not LOG_WEBHOOK_URL:
         return
@@ -191,7 +197,7 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 8. 팀장 질의서 모달 UI 생성 (오류 방어형)
+# 9. 팀장 질의서 모달 UI 생성
 def create_inquiry_modal(trigger_id: str, channel_id: str, thread_ts: str, user_name: str, default_q: str = ""):
     return {
         "trigger_id": trigger_id,
@@ -280,7 +286,7 @@ def create_inquiry_modal(trigger_id: str, channel_id: str, thread_ts: str, user_
         }
     }
 
-# 9. 질문 처리 및 응답 전송 로직
+# 10. 질문 처리 및 응답 전송 로직
 def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str, user_id: str):
     is_thread_reply = bool(thread_ts and thread_ts != ts)
     target_ts = thread_ts if is_thread_reply else ts
@@ -300,24 +306,30 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     else:
         first_q_clean = clean_prompt
 
+    # 에스컬레이션 조건 판별: (3회 이상 질문 지속) OR (상담사가 팀장/관리자/SV 직접 확인 의사 표명)
+    wants_manual_escalate = check_manual_escalation_intent(clean_prompt)
+    is_escalation_triggered = (user_q_count >= 3) or wants_manual_escalate
+
     search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
     knowledge = search_relevant_knowledge(search_target)
 
-    # 3회 이상 후속 질의 시 팀장 질의 안내 유도
-    escalation_guide_prompt = ""
-    if user_q_count >= 3:
+    # 에스컬레이션 조건 발동 시의 특별 프롬프트
+    if is_escalation_triggered:
         escalation_guide_prompt = """
-*특별 지침 (3회 이상 질의 지속 중)*:
-상담원이 동일 스레드에서 3회 이상 질문을 이어가고 있습니다. 
-답변 끝에 반드시 "해당 문의는 건별 예외 승인이나 세부 확인이 필요할 수 있으니, 아래 [📋 팀장 질의서 작성] 버튼을 통해 접수 대장으로 이관해 보시기를 권장드립니다."라는 따뜻한 안내 문구를 덧붙이세요.
+*중요 특별 지침 (관리자/팀장 에스컬레이션 모드)*:
+상담원이 3회 이상 질문을 거듭하고 있거나, 팀장/관리자/SV 확인을 직접 희망하고 있습니다.
+AI가 모든 것을 단정 지어 결론 내리지 마세요. 
+"해당 문의는 건별 특수 상황이나 예외 승인 기준이 필요할 수 있어, AI 지식만으로는 정확한 확인이 어려울 수 있습니다. 상담원님께서 안전하고 정확하게 처리하실 수 있도록 아래 [📋 팀장 질의서 작성]을 통해 팀장님(관리자님)께 직접 확인해 보시는 것을 권장해 드립니다."라고 안내하고 팀장 질의서 작성을 적극 유도하세요.
 """
+    else:
+        escalation_guide_prompt = ""
 
     system_instruction = f"""
 당신은 상담원들을 지원하는 따뜻하고 상냥한 사내 AI 어시스턴트입니다.
 
 [⚠️ 최우선 검수 보정 지식 (팀장/관리자가 수정한 피드백)]:
 {json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}
-*중요*: 피드백이 두서없이 메모되어 있더라도 핵심을 추출하여 명확하고 다정한 표준 가이드라인으로 정리해 안내하세요.
+*중요*: 피드백이 두서없이 적혀 있더라도 핵심을 추출하여 명확하고 다정한 표준 규정 안내 양식으로 정리하세요.
 
 [사내 마스터 규정 지식 베이스]:
 {json.dumps(knowledge['master_rules'], ensure_ascii=False, indent=2)}
@@ -325,7 +337,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [이전 대화 맥락]:
 {thread_history if thread_history else "신규 질문입니다."}
 
-[현재 질문 (스레드 누적 {user_q_count}회차)]:
+[현재 상담원 질문 (스레드 누적 {user_q_count}회차)]:
 {clean_prompt}
 {escalation_guide_prompt}
 
@@ -333,8 +345,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 1. 첫 문장은 상담원에게 힘을 주는 따뜻하고 밝은 인사로 시작하세요.
 2. 규정 내용은 핵심 항목별로 이모티콘(📌, ✔️, 💡 등)과 볼드체(*텍스트*)를 사용하여 가독성 높게 정리하세요.
 3. 스레드 연속 대화인 경우 이전 맥락을 이어 자연스럽고 일관되게 설명하세요.
-4. 관리자/팀장님 언급 시 현장 상황에 맞춰 자연스럽게 안내하세요.
-5. 마무리는 다정하고 힘찬 응원으로 끝맺어 주세요.
+4. 마무리는 다정하고 힘찬 응원으로 끝맺어 주세요.
 """
 
     answer = call_gemini_api(system_instruction)
@@ -345,47 +356,52 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception:
             pass
 
-        # 버튼 2종 구성
-        blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
-            {"type": "divider"},
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "📋 팀장 질의서 작성 (전송)"},
-                        "style": "primary",
-                        "action_id": "open_inquiry_modal_btn",
-                        "value": target_ts
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "❌ 질의서 작성 안 함 (해결됨)"},
-                        "action_id": "dismiss_inquiry_btn",
-                        "value": target_ts
-                    }
-                ]
-            }
-        ]
+        # 에스컬레이션 조건일 때만 버튼 블록 첨부
+        if is_escalation_triggered:
+            blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
+                {"type": "divider"},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "📋 팀장 질의서 작성 (전송)"},
+                            "style": "primary",
+                            "action_id": "open_inquiry_modal_btn",
+                            "value": target_ts
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "❌ 질의서 작성 안 함 (해결됨)"},
+                            "action_id": "dismiss_inquiry_btn",
+                            "value": target_ts
+                        }
+                    ]
+                }
+            ]
+            post_kwargs = {"blocks": blocks}
+        else:
+            # 평상시에는 버튼 없이 텍스트 답변만 깔끔하게 전송
+            post_kwargs = {}
 
         try:
             slack_client.chat_postMessage(
                 channel=channel,
                 thread_ts=target_ts,
                 text=answer,
-                blocks=blocks
+                **post_kwargs
             )
             slack_client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
         except Exception as e:
             print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 구글 시트 로그 기록
+    # 구글 시트에 질의로그 기록
     gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
 
-# 10. Slack Events 엔드포인트
+# 11. Slack Events 엔드포인트
 PROCESSED_EVENT_IDS = OrderedDict()
 
 @app.post("/slack/events")
@@ -417,7 +433,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 11. Slack Interactivity 엔드포인트 (오류 방어형)
+# 12. Slack Interactivity 엔드포인트 (모달 및 액션 핸들러)
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request):
     try:
@@ -437,7 +453,6 @@ async def slack_interactive(request: Request):
                     user_info = payload.get("user", {})
                     user_id = user_info.get("id")
 
-                    # value가 단순 문자열(ts)이든 JSON이든 안전하게 파싱
                     thread_ts = raw_val
                     default_q = ""
                     if "{" in raw_val and "}" in raw_val:
@@ -448,14 +463,13 @@ async def slack_interactive(request: Request):
                         except Exception:
                             pass
 
-                    # 권한 에러 방지: users_info 실패 시 payload의 유저명 사용
                     user_name = user_info.get("name", "상담사")
                     if slack_client:
                         try:
                             u_res = slack_client.users_info(user=user_id)
                             user_name = u_res.get("user", {}).get("real_name", user_name)
                         except Exception as e:
-                            print(f"⚠️ users_info 조회 생략(기본 유저명 사용): {e}")
+                            print(f"⚠️ users_info 조회 생략: {e}")
 
                     modal_payload = create_inquiry_modal(trigger_id, channel_id, thread_ts, user_name, default_q)
                     if slack_client:
@@ -472,7 +486,7 @@ async def slack_interactive(request: Request):
                         slack_client.chat_postMessage(
                             channel=channel_id,
                             thread_ts=thread_ts,
-                            text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다. 오늘도 화이팅하세요! ✨"
+                            text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다. 오늘도 좋은 하루 보내세요! ✨"
                         )
                     return {"status": "ok"}
 
@@ -517,7 +531,7 @@ async def slack_interactive(request: Request):
                 return {"response_action": "clear"}
 
     except Exception as err:
-        print(f"❌ interactive 엔드포인트 에러 발생: {err}")
+        print(f"❌ interactive 처리 에러: {err}")
         return {"status": "error", "message": str(err)}
 
     return {"status": "ok"}
