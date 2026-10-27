@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 
-# 1. .env 환경변수 로드
+# 1. 환경변수 로드
 load_dotenv()
 
 app = FastAPI()
@@ -38,30 +38,24 @@ CORRECTED_CACHE = []
 LAST_SYNC_TIME = 0
 
 def fetch_master_knowledge():
-    """기본 마스터 지식 로드"""
     global KNOWLEDGE_CACHE
     try:
         res = requests.get(SHEET_CSV_URL, timeout=10)
         res.raise_for_status()
         res.encoding = 'utf-8'
-        csv_reader = csv.reader(io.StringIO(res.text))
-        rows = list(csv_reader)
+        rows = list(csv.reader(io.StringIO(res.text)))
         if not rows:
             return
         header = rows[0]
-        parsed = []
-        for row in rows[1:]:
-            if not any(row):
-                continue
-            entry = {header[i].strip(): row[i].strip() for i in range(min(len(header), len(row)))}
-            parsed.append(entry)
-        KNOWLEDGE_CACHE = parsed
+        KNOWLEDGE_CACHE = [
+            {header[i].strip(): row[i].strip() for i in range(min(len(header), len(row)))}
+            for row in rows[1:] if any(row)
+        ]
         print(f"✅ 마스터 지식 로드 완료: {len(KNOWLEDGE_CACHE)}건")
     except Exception as e:
         print(f"❌ 마스터 지식 로드 실패: {e}")
 
 def fetch_corrected_knowledge():
-    """💬실시간_질의로그 및 📋상담사 질의의 관리자 보정 데이터 로드"""
     global CORRECTED_CACHE
     if not LOG_WEBHOOK_URL:
         return
@@ -70,7 +64,7 @@ def fetch_corrected_knowledge():
         if res.status_code == 200:
             data = res.json()
             CORRECTED_CACHE = data.get("data", [])
-            print(f"✅ 관리자 보정 피드백 지식 로드 완료: {len(CORRECTED_CACHE)}건")
+            print(f"✅ 실시간 보정 지식 로드 완료: {len(CORRECTED_CACHE)}건")
     except Exception as e:
         print(f"⚠️ 보정 지식 로드 실패: {e}")
 
@@ -83,12 +77,11 @@ def refresh_all_knowledge():
 refresh_all_knowledge()
 
 def normalize_text(text: str) -> str:
-    text = text.lower()
-    return re.sub(r'[\s\-_/&]+', '', text)
+    return re.sub(r'[\s\-_/&]+', '', text.lower())
 
 def search_relevant_knowledge(query: str, top_k: int = 4) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
-    if time.time() - LAST_SYNC_TIME > 600: # 10분 주기 동기화
+    if time.time() - LAST_SYNC_TIME > 600:
         refresh_all_knowledge()
 
     cleaned_query = normalize_text(query)
@@ -117,10 +110,9 @@ def search_relevant_knowledge(query: str, top_k: int = 4) -> dict:
 
 # 4. 볼드체 변환 유틸 (Gemini **text** -> Slack *text*)
 def convert_to_slack_markdown(text: str) -> str:
-    # **텍스트** 를 *텍스트* 로 치환
     return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
 
-# 5. Gemini 호출 함수
+# 5. Gemini API 호출 함수
 def call_gemini_api(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
@@ -145,10 +137,9 @@ def call_gemini_api(prompt: str) -> str:
                 if res.status_code == 200:
                     data = res.json()
                     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    # 볼드체 서식 변환 후 반환
                     return convert_to_slack_markdown(raw_text)
                 else:
-                    last_error_msg = f"{model} ({res.status_code}): {res.text}"
+                    last_error_msg = f"{model} ({res.status_code})"
             except Exception as e:
                 last_error_msg = str(e)
 
@@ -156,33 +147,41 @@ def call_gemini_api(prompt: str) -> str:
 
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(원인: {last_error_msg[:100]})"
 
-# 6. 스레드 이전 대화 내역 조회 (연속 대화 맥락)
-def get_thread_context(channel: str, thread_ts: str) -> tuple:
+# 6. 스레드 히스토리 및 질문 횟수 수집
+def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
     if not slack_client or not thread_ts:
-        return "", ""
+        return "", "", 1
     try:
-        res = slack_client.conversations_replies(channel=channel, ts=thread_ts, limit=15)
+        res = slack_client.conversations_replies(channel=channel, ts=thread_ts, limit=20)
         messages = res.get("messages", [])
         if not messages:
-            return "", ""
-            
-        first_question = messages[0].get("text", "")
+            return "", "", 1
+
+        first_q = messages[0].get("text", "")
         history = []
-        for m in messages[:-1]: # 현재 메시지 직전까지 수집
-            role = "AI" if "bot_id" in m else "상담원"
+        user_question_count = 0
+
+        for m in messages[:-1]:
+            is_bot = "bot_id" in m
+            if not is_bot:
+                user_question_count += 1
+            role = "AI" if is_bot else "상담원"
             history.append(f"{role}: {m.get('text', '')}")
-            
-        return first_question, "\n".join(history)
+
+        # 현재 수신된 질문 포함
+        total_user_count = user_question_count + 1
+        return first_q, "\n".join(history), total_user_count
     except Exception as e:
         print(f"⚠️ 스레드 문맥 조회 실패: {e}")
-        return "", ""
+        return "", "", 1
 
-# 7. 구글 시트 로그 전송
+# 7. 구글 시트 질의로그 전송 (💬실시간_질의로그)
 def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, sub_q: str, answer: str):
     if not LOG_WEBHOOK_URL:
         return
     try:
         requests.post(LOG_WEBHOOK_URL, json={
+            "action": "log",
             "gubun": gubun,
             "thread_ts": thread_ts,
             "user_id": user_id,
@@ -191,14 +190,102 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
             "answer": answer
         }, timeout=5)
     except Exception as e:
-        print(f"⚠️ 시트 로깅 통신 실패: {e}")
+        print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 8. 질문 처리 및 응답 로직
+# 8. 모달 UI 생성 함수 (보람상조 양평센터 대장 양식 매핑)
+def create_inquiry_modal(trigger_id: str, channel_id: str, thread_ts: str, user_name: str, default_q: str = ""):
+    return {
+        "trigger_id": trigger_id,
+        "view": {
+            "type": "modal",
+            "callback_id": "submit_inquiry_modal",
+            "title": {"type": "plain_text", "text": "📋 관리자 질의서 접수"},
+            "submit": {"type": "plain_text", "text": "접수 제출"},
+            "close": {"type": "plain_text", "text": "취소"},
+            "private_metadata": json.dumps({
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "user_name": user_name
+            }),
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"👤 *작성자:* {user_name} (자동 등록)\n📌 제출 시 *양평센터 질의 접수 및 처리 현황 관리 대장*에 즉시 등록됩니다."
+                    }
+                },
+                {"type": "divider"},
+                {
+                    "type": "input",
+                    "block_id": "team_block",
+                    "label": {"type": "plain_text", "text": "소속팀"},
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "team_select",
+                        "placeholder": {"type": "plain_text", "text": "소속팀 선택"},
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "1팀"}, "value": "1팀"},
+                            {"text": {"type": "plain_text", "text": "2팀"}, "value": "2팀"},
+                            {"text": {"type": "plain_text", "text": "3팀"}, "value": "3팀"},
+                            {"text": {"type": "plain_text", "text": "5팀"}, "value": "5팀"},
+                            {"text": {"type": "plain_text", "text": "6팀"}, "value": "6팀"},
+                            {"text": {"type": "plain_text", "text": "지원/마스터팀"}, "value": "지원팀"}
+                        ]
+                    }
+                },
+                {
+                    "type": "input",
+                    "block_id": "contract_block",
+                    "label": {"type": "plain_text", "text": "계약번호 / 연락처"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "contract_input",
+                        "placeholder": {"type": "plain_text", "text": "계약번호 또는 전화번호 (예: 010-1234-5678)"}
+                    }
+                },
+                {
+                    "type": "input",
+                    "block_id": "customer_block",
+                    "label": {"type": "plain_text", "text": "회원명"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "customer_input",
+                        "placeholder": {"type": "plain_text", "text": "회원 성함 (확인 불가 시 '미확인')"}
+                    }
+                },
+                {
+                    "type": "input",
+                    "block_id": "customer_inquiry_block",
+                    "label": {"type": "plain_text", "text": "고객 문의 내용"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "customer_inquiry_input",
+                        "multiline": True,
+                        "placeholder": {"type": "plain_text", "text": "고객이 문의한 인입 배경 및 질문 사항 요약"}
+                    }
+                },
+                {
+                    "type": "input",
+                    "block_id": "counselor_inquiry_block",
+                    "label": {"type": "plain_text", "text": "작성자 문의 내용 (관리자 질의)"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "counselor_inquiry_input",
+                        "multiline": True,
+                        "initial_value": default_q if default_q else "",
+                        "placeholder": {"type": "plain_text", "text": "관리자/SV에게 확인받고자 하는 구체적인 처리 기준"}
+                    }
+                }
+            ]
+        }
+    }
+
+# 9. 질문 처리 및 응답 전송 로직
 def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str, user_id: str):
     is_thread_reply = bool(thread_ts and thread_ts != ts)
     target_ts = thread_ts if is_thread_reply else ts
 
-    # 확인용 이모지 👀 추가
     if slack_client:
         try:
             slack_client.reactions_add(channel=channel, timestamp=ts, name="eyes")
@@ -206,75 +293,99 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
             pass
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
-    
-    # 스레드 대댓글인 경우 맥락 조회
-    first_q_text, thread_history = ("", "")
+
+    first_q_text, thread_history, user_q_count = ("", "", 1)
     if is_thread_reply:
-        first_q_text, thread_history = get_thread_context(channel, thread_ts)
+        first_q_text, thread_history, user_q_count = get_thread_context_and_count(channel, thread_ts)
         first_q_clean = re.sub(r'^\[질의-AI\]\s*', '', first_q_text).strip()
     else:
         first_q_clean = clean_prompt
 
-    # 관련 규정 및 보정 지식 검색
     search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
     knowledge = search_relevant_knowledge(search_target)
+
+    # 3회 이상 스레드 후속 질의 여부에 따른 유도 프롬프트 추가
+    escalation_guide_prompt = ""
+    if user_q_count >= 3:
+        escalation_guide_prompt = """
+*특별 지침 (3회 이상 질의 지속 중)*:
+상담원이 동일 스레드에서 3회 이상 질문을 이어가고 있습니다. 
+답변의 마지막 부분에 반드시 "해당 건은 상황에 따른 예외 기준이나 세부 확인이 필요할 수 있으니, 아래 [📋 관리자 질의서 작성] 버튼을 눌러 양평센터 관리 대장으로 질의서를 접수해 주시길 권장해 드립니다."라는 친절한 안내 문구를 덧붙이세요.
+"""
 
     system_instruction = f"""
 당신은 상담원들을 지원하는 따뜻하고 상냥한 사내 AI 어시스턴트입니다.
 
 [⚠️ 최우선 검수 보정 지식 (관리자가 수정한 피드백)]:
 {json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}
-*중요 지침*: 위 최우선 보정 지식에 관리자가 두서없이 적어둔 메모나 보정 내용이 있더라도, 그 핵심 의도를 완벽히 파악하여 빠짐없이 반영하세요. 사용자가 보기에 다정하고 정돈된 최종 표준 가이드라인 양식으로 재구성해 답변해야 합니다.
+*중요*: 보정 내용이 두서없이 메모되어 있더라도 핵심을 추출하여 명확하고 정돈된 최종 표준 가이드라인으로 답변하세요.
 
-[사내 규정 지식 베이스]:
+[사내 마스터 규정 지식 베이스]:
 {json.dumps(knowledge['master_rules'], ensure_ascii=False, indent=2)}
 
-[이전 스레드 대화 맥락]:
+[이전 대화 맥락]:
 {thread_history if thread_history else "신규 질문입니다."}
 
-[상담원의 현재 질문]:
+[현재 질문 (스레드 누적 {user_q_count}회차)]:
 {clean_prompt}
+{escalation_guide_prompt}
 
 [답변 작성 가이드라인]:
 1. 첫 문장은 상담원에게 힘을 주는 따뜻하고 밝은 인사로 시작하세요.
-2. 내용은 핵심 항목별로 이모티콘(📌, ✔️, 💡 등)과 볼드체를 적절히 사용하여 가독성 높게 정리하세요.
-3. 스레드 연속 대화인 경우, 이전 답변과 자연스럽게 연결되는 어조로 답변하세요.
+2. 규정 내용은 핵심 항목별로 이모티콘(📌, ✔️, 💡 등)과 볼드체(*텍스트*)를 사용하여 가독성 높게 정리하세요.
+3. 스레드 연속 대화인 경우 이전 맥락을 이어 자연스럽고 일관되게 설명하세요.
 4. 마무리는 다정하고 힘찬 응원으로 끝맺어 주세요.
 """
 
     answer = call_gemini_api(system_instruction)
 
     if slack_client:
-        # 👀 삭제
         try:
             slack_client.reactions_remove(channel=channel, timestamp=ts, name="eyes")
         except Exception:
             pass
 
-        # 스레드 답변 전송 및 ✅ 추가
+        # 버튼 2개 구성: [전송하기] / [안하기(해결됨)]
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
+            {"type": "divider"},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "📋 관리자 질의서 작성 (전송)"},
+                        "style": "primary",
+                        "action_id": "open_inquiry_modal_btn",
+                        "value": json.dumps({"thread_ts": target_ts, "last_q": clean_prompt})
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ 질의서 작성 안 함 (해결됨)"},
+                        "action_id": "dismiss_inquiry_btn",
+                        "value": target_ts
+                    }
+                ]
+            }
+        ]
+
         try:
             slack_client.chat_postMessage(
                 channel=channel,
                 thread_ts=target_ts,
-                text=answer
+                text=answer,
+                blocks=blocks
             )
             slack_client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
         except Exception as e:
             print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 구글 시트에 A~I열 규격으로 저장
-    gubun_val = "대댓글질의" if is_thread_reply else "최초답변"
+    # 구글 시트에 질의로그 저장
+    gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
-    log_to_google_sheet(
-        gubun=gubun_val,
-        thread_ts=target_ts,
-        user_id=user_id,
-        first_q=first_q_clean,
-        sub_q=sub_q_val,
-        answer=answer
-    )
+    log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
 
-# 9. 슬랙 이벤트 라우팅
+# 10. Slack Events 엔드포인트
 PROCESSED_EVENT_IDS = OrderedDict()
 
 @app.post("/slack/events")
@@ -301,9 +412,92 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     bot_id = event.get("bot_id")
     user_id = event.get("user", "상담원")
 
-    if not bot_id:
-        # 최초 질문([질의-AI])이거나 생성된 스레드 안에서의 대댓글인 경우 자동 처리
-        if text.startswith("[질의-AI]") or (thread_ts and thread_ts != ts):
-            background_tasks.add_task(process_slack_question, channel, ts, thread_ts, text, user_id)
+    if not bot_id and (text.startswith("[질의-AI]") or (thread_ts and thread_ts != ts)):
+        background_tasks.add_task(process_slack_question, channel, ts, thread_ts, text, user_id)
+
+    return {"status": "ok"}
+
+# 11. Slack Interactivity 엔드포인트 (버튼 클릭 & 모달 제출 처리)
+@app.post("/slack/interactive")
+async def slack_interactive(request: Request):
+    form_data = await request.form()
+    payload = json.loads(form_data.get("payload"))
+
+    # 1) 버튼 클릭 액션 처리
+    if payload.get("type") == "block_actions":
+        for action in payload.get("actions", []):
+            action_id = action.get("action_id")
+
+            # [전송 - 관리자 질의서 작성] 클릭 시
+            if action_id == "open_inquiry_modal_btn":
+                trigger_id = payload.get("trigger_id")
+                channel_id = payload.get("channel", {}).get("id")
+                btn_data = json.loads(action.get("value", "{}"))
+                thread_ts = btn_data.get("thread_ts")
+                last_q = btn_data.get("last_q", "")
+                user_id = payload.get("user", {}).get("id")
+
+                user_res = slack_client.users_info(user=user_id) if slack_client else {}
+                user_name = user_res.get("user", {}).get("real_name", "상담사")
+
+                modal_payload = create_inquiry_modal(trigger_id, channel_id, thread_ts, user_name, last_q)
+                if slack_client:
+                    slack_client.views_open(**modal_payload)
+                return {"status": "ok"}
+
+            # [안 함 - 해결됨] 클릭 시
+            elif action_id == "dismiss_inquiry_btn":
+                channel_id = payload.get("channel", {}).get("id")
+                thread_ts = action.get("value")
+                user_id = payload.get("user", {}).get("id")
+
+                if slack_client:
+                    slack_client.chat_postMessage(
+                        channel=channel_id,
+                        thread_ts=thread_ts,
+                        text=f"👍 <@{user_id}> 상담원님, 문의가 원활히 해결되어 질의서 작성을 종료합니다. 힘찬 하루 보내세요! ✨"
+                    )
+                return {"status": "ok"}
+
+    # 2) 모달 제출 시 처리
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {})
+        if view.get("callback_id") == "submit_inquiry_modal":
+            values = view.get("state", {}).get("values", {})
+            meta = json.loads(view.get("private_metadata", "{}"))
+
+            team = values["team_block"]["team_select"]["selected_option"]["value"]
+            contract = values["contract_block"]["contract_input"].get("value", "")
+            customer_name = values["customer_block"]["customer_input"].get("value", "")
+            customer_q = values["customer_inquiry_block"]["customer_inquiry_input"].get("value", "")
+            my_q = values["counselor_inquiry_block"]["counselor_inquiry_input"].get("value", "")
+
+            # 📋상담사 질의 시트에 맞춤 전송
+            sheet_payload = {
+                "action": "escalate",
+                "team": team,
+                "author": meta.get("user_name"),
+                "contract": contract,
+                "name": customer_name,
+                "customerQ": customer_q,
+                "myQ": my_q
+            }
+
+            try:
+                requests.post(LOG_WEBHOOK_URL, json=sheet_payload, timeout=5)
+            except Exception as e:
+                print(f"⚠️ 상담사 질의 대장 전송 실패: {e}")
+
+            # 슬랙 스레드에 등록 안내 알림 발송
+            channel_id = meta.get("channel_id")
+            thread_ts = meta.get("thread_ts")
+            if slack_client:
+                slack_client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=f"✅ *관리자 질의서가 양평센터 대장에 등록되었습니다.*\n• *소속:* {team} | *회원명:* {customer_name}\n• *질의 요약:* {my_q}"
+                )
+
+            return {"response_action": "clear"}
 
     return {"status": "ok"}
