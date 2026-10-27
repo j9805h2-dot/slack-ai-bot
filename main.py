@@ -228,7 +228,7 @@ def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str) -> di
                 "element": {
                     "type": "plain_text_input",
                     "action_id": "author_input",
-                    "initial_value": user_name if user_name else "상담사",
+                    "initial_value": user_name if user_name else "",
                     "placeholder": {"type": "plain_text", "text": "성함을 입력하세요."}
                 }
             },
@@ -299,17 +299,14 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     wants_manual_escalate = check_manual_escalation_intent(clean_prompt)
     is_escalation_triggered = (user_q_count >= 3) or wants_manual_escalate
 
-    # [수정 1] 최초 인입 시 또는 스레드에서 바로 관리자 호출을 명시한 경우 긴 사설 없이 즉시 심플 응답
     if wants_manual_escalate:
-        answer = "제가 완벽하게 답변드리지 못해 죄송합니다. 다음번엔 더 정확하고 완벽하게 안내해 드릴 수 있도록 노력하겠습니다!\n\n해당 문의는 아래 버튼을 통해 관리자(SV)님께 바로 질의해 주시면 됩니다."
+        answer = "관리자(SV)님께 바로 질문하실 수 있도록 접수를 도와드리겠습니다.\n아래 *[📋 관리자(SV) 질의 접수]* 버튼을 눌러 내용을 작성해 주세요!"
     elif user_q_count >= 3:
-        # 3회 이상 질문 누적 시 기본 지식 답변 + 하단에 정중하고 간결한 사과 유도문
         search_target = f"{first_q_clean} {clean_prompt}"
         knowledge = search_relevant_knowledge(search_target)
         system_instruction = f"""
 당신은 상담원들을 지원하는 사내 AI 어시스턴트입니다.
 사내 규정 지식을 바탕으로 간결하고 명확하게 핵심만 답변하세요.
-사설이나 장황한 인사/응원은 최소화하세요.
 
 [사내 규정 지식]:
 {json.dumps(knowledge['master_rules'], ensure_ascii=False, indent=2)}
@@ -318,9 +315,8 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 {clean_prompt}
 """
         base_answer = call_gemini_api(system_instruction)
-        answer = f"{base_answer}\n\n---\n*안내*: 제가 명쾌하게 해결해 드리지 못해 죄송합니다. 다음엔 더 완벽히 숙지해 도움드릴 수 있도록 하겠습니다!\n정확한 예외 처리 기준은 아래 버튼을 눌러 관리자(SV)님께 접수해 주시길 권장드립니다."
+        answer = f"{base_answer}\n\n---\n*안내*: 추가적인 예외 기준이나 세부 확인이 필요하신 경우, 아래 버튼을 통해 관리자(SV)님께 바로 질의서를 접수하실 수 있습니다."
     else:
-        # 평상시 일반 질문 답변
         knowledge = search_relevant_knowledge(clean_prompt)
         system_instruction = f"""
 당신은 상담원들을 지원하는 사내 AI 어시스턴트입니다.
@@ -343,7 +339,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception:
             pass
 
-        # 에스컬레이션 트리거 시 버튼 2개 부착
         if is_escalation_triggered:
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
@@ -382,7 +377,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception as e:
             print(f"❌ 슬랙 전송 실패: {e}")
 
-    # 구글 시트 질의로그 기록
     gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
@@ -419,7 +413,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 모달 제출 후 시트 전송 처리
+# 12. 모달 제출 후 시트 전송 처리 (Q열용 슬랙 스레드 키값 포함)
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -431,6 +425,10 @@ def bg_process_submission(view: dict):
     customer_q = values.get("customerQ_block", {}).get("customerQ_input", {}).get("value", "")
     my_q = values.get("myQ_block", {}).get("myQ_input", {}).get("value", "")
 
+    channel_id = meta.get("channel_id")
+    thread_ts = meta.get("thread_ts")
+    slack_thread_key = f"{channel_id}|{thread_ts}"
+
     sheet_payload = {
         "action": "escalate",
         "team": team,
@@ -438,7 +436,8 @@ def bg_process_submission(view: dict):
         "contract": contract,
         "name": name,
         "customerQ": customer_q,
-        "myQ": my_q
+        "myQ": my_q,
+        "slack_thread_key": slack_thread_key  # 구글 시트 Q열에 저장됨
     }
 
     if LOG_WEBHOOK_URL:
@@ -447,14 +446,13 @@ def bg_process_submission(view: dict):
         except Exception as e:
             print(f"⚠️ 대장 전송 실패: {e}")
 
-    channel_id = meta.get("channel_id")
-    thread_ts = meta.get("thread_ts")
+    # 슬랙 스레드에 접수 완료 알림 발송 (기존 캡처 이미지 안내 문구 적용)
     if slack_client and channel_id and thread_ts:
         try:
             slack_client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=f"✅ *관리자(SV) 질의서가 접수 대장에 등록되었습니다.*\n• *소속:* {team} | *작성자:* {author} | *회원명:* {name}\n• *질의 요약:* {my_q}"
+                text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~"
             )
         except Exception as e:
             print(f"⚠️ 완료 알림 실패: {e}")
@@ -480,16 +478,25 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                     trigger_id = payload.get("trigger_id")
                     channel_id = payload.get("channel", {}).get("id")
                     user_info = payload.get("user", {})
+                    user_id = user_info.get("id")
                     user_name = user_info.get("name", "상담사")
 
                     if slack_client and trigger_id:
+                        try:
+                            u_info = slack_client.users_info(user=user_id)
+                            if u_info.get("ok"):
+                                profile = u_info["user"].get("profile", {})
+                                user_name = profile.get("display_name") or profile.get("real_name") or u_info["user"].get("real_name") or user_name
+                        except Exception as e:
+                            print(f"⚠️ users_info 조회 예외: {e}")
+
                         modal_view = build_modal_view_dict(channel_id, raw_val, user_name)
                         try:
                             api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
                             if not api_res.get("ok"):
                                 print(f"❌ views.open 실패: {api_res.get('error')}")
                             else:
-                                print(f"✅ 모달 팝업 성공! (user: {user_name})")
+                                print(f"✅ 모달 팝업 성공! (실명: {user_name})")
                         except Exception as e:
                             print(f"❌ views_open 호출 예외: {e}")
 
