@@ -175,7 +175,7 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
         print(f"⚠️ 스레드 문맥 조회 예외: {e}")
         return "", "", 1
 
-# 7. 관리자 질의 키워드 감지 유틸
+# 7. 관리자/팀장/SV 질의 의도 감지
 def check_manual_escalation_intent(text: str) -> bool:
     keywords = ["팀장", "관리자", "sv", "에스브이", "상급자", "물어볼", "물어봐야", "확인해볼", "올려볼", "질의서"]
     normalized = text.lower()
@@ -198,92 +198,83 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 9. 팀장 질의서 모달 UI 생성 (안전 규격 준수)
-def build_modal_view(trigger_id: str, channel_id: str, thread_ts: str, user_name: str):
+# 9. 캡처 이미지와 100% 동일한 모달 UI 뷰 생성
+def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, default_q: str = "") -> dict:
     return {
-        "trigger_id": trigger_id,
-        "view": {
-            "type": "modal",
-            "callback_id": "submit_inquiry_modal",
-            "title": {"type": "plain_text", "text": "팀장 질의서 접수"},
-            "submit": {"type": "plain_text", "text": "제출하기"},
-            "close": {"type": "plain_text", "text": "닫기"},
-            "private_metadata": json.dumps({
-                "channel_id": channel_id,
-                "thread_ts": thread_ts,
-                "user_name": user_name
-            }),
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"👤 *작성자:* {user_name}\n📌 제출 시 *양평센터 질의 대장*에 실시간으로 등록됩니다."
-                    }
-                },
-                {"type": "divider"},
-                {
-                    "type": "input",
-                    "block_id": "team_block",
-                    "label": {"type": "plain_text", "text": "소속팀"},
-                    "element": {
-                        "type": "static_select",
-                        "action_id": "team_select",
-                        "placeholder": {"type": "plain_text", "text": "소속팀 선택"},
-                        "options": [
-                            {"text": {"type": "plain_text", "text": "1팀"}, "value": "1팀"},
-                            {"text": {"type": "plain_text", "text": "2팀"}, "value": "2팀"},
-                            {"text": {"type": "plain_text", "text": "3팀"}, "value": "3팀"},
-                            {"text": {"type": "plain_text", "text": "5팀"}, "value": "5팀"},
-                            {"text": {"type": "plain_text", "text": "6팀"}, "value": "6팀"},
-                            {"text": {"type": "plain_text", "text": "지원/마스터팀"}, "value": "지원팀"}
-                        ]
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "contract_block",
-                    "label": {"type": "plain_text", "text": "계약번호 / 연락처"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "contract_input",
-                        "placeholder": {"type": "plain_text", "text": "계약번호 또는 전화번호 (예: 010-1234-5678)"}
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "customer_block",
-                    "label": {"type": "plain_text", "text": "회원명"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "customer_input",
-                        "placeholder": {"type": "plain_text", "text": "회원 성함 (확인 불가 시 '미확인')"}
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "customer_inquiry_block",
-                    "label": {"type": "plain_text", "text": "고객 문의 내용"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "customer_inquiry_input",
-                        "multiline": True,
-                        "placeholder": {"type": "plain_text", "text": "고객 인입 배경 및 문의 사항 요약"}
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "counselor_inquiry_block",
-                    "label": {"type": "plain_text", "text": "작성자 문의 내용 (팀장 질의)"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "counselor_inquiry_input",
-                        "multiline": True,
-                        "placeholder": {"type": "plain_text", "text": "팀장님께 확인받고자 하는 구체적인 처리 기준"}
-                    }
+        "type": "modal",
+        "callback_id": "submit_inquiry_modal",
+        "title": {"type": "plain_text", "text": "📋 관리자(SV) 질의 접수"},
+        "submit": {"type": "plain_text", "text": "전송"},
+        "close": {"type": "plain_text", "text": "취소"},
+        "private_metadata": json.dumps({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts
+        }),
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "team_block",
+                "label": {"type": "plain_text", "text": "소속팀 *"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "team_input",
+                    "placeholder": {"type": "plain_text", "text": "예: 1팀, 6팀"}
                 }
-            ]
-        }
+            },
+            {
+                "type": "input",
+                "block_id": "author_block",
+                "label": {"type": "plain_text", "text": "상담사명(작성자) *"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "author_input",
+                    "initial_value": user_name if user_name else "",
+                    "placeholder": {"type": "plain_text", "text": "성함을 입력하세요."}
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "contract_block",
+                "label": {"type": "plain_text", "text": "계약번호 / 연락처 *"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "contract_input",
+                    "placeholder": {"type": "plain_text", "text": "계약번호 또는 전화번호"}
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "name_block",
+                "label": {"type": "plain_text", "text": "회원명 *"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "name_input",
+                    "placeholder": {"type": "plain_text", "text": "회원명을 입력하세요."}
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "customerQ_block",
+                "label": {"type": "plain_text", "text": "고객 문의 내용(고객) *"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "customerQ_input",
+                    "placeholder": {"type": "plain_text", "text": "고객이 인입 시 문의한 핵심 내용"}
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "myQ_block",
+                "label": {"type": "plain_text", "text": "문의 내용(내가 궁금한 점) *"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "myQ_input",
+                    "multiline": True,
+                    "initial_value": default_q if default_q else "",
+                    "placeholder": {"type": "plain_text", "text": "확인받고자 하는 구체적인 내용 작성"}
+                }
+            }
+        ]
     }
 
 # 10. 질문 처리 및 응답 전송 로직
@@ -314,10 +305,10 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
     if is_escalation_triggered:
         escalation_guide_prompt = """
-*중요 특별 지침 (팀장/관리자 에스컬레이션 모드)*:
-상담원이 질문을 3회 이상 이어가고 있거나, 팀장/관리자/SV 확인을 직접 희망하고 있습니다.
+*중요 특별 지침 (관리자/팀장/SV 에스컬레이션 모드)*:
+상담원이 질문을 3회 이상 이어가고 있거나, 팀장/관리자/SV 확인을 직접 원하고 있습니다.
 AI가 모든 결론을 단정 짓지 마세요. 
-"해당 문의는 특수 상황이나 예외적인 승인 기준이 필요할 수 있어, AI 지식만으로는 정확한 확인이 어려울 수 있습니다. 상담원님께서 안전하게 처리하실 수 있도록 아래 [📋 팀장 질의서 작성]을 통해 팀장님께 직접 확인해 보시는 것을 권장해 드립니다."라고 안내하세요.
+"해당 문의는 건별 특수 상황이나 예외적인 승인 기준이 필요할 수 있어, AI 지식만으로는 정확한 확인이 어려울 수 있습니다. 상담원님께서 안전하고 정확하게 처리하실 수 있도록 아래 [📋 관리자(SV) 질의 접수] 버튼을 통해 직접 확인해 보시는 것을 권장해 드립니다."라고 안내하세요.
 """
     else:
         escalation_guide_prompt = ""
@@ -363,7 +354,7 @@ AI가 모든 결론을 단정 짓지 마세요.
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "📋 팀장 질의서 작성 (전송)"},
+                            "text": {"type": "plain_text", "text": "📋 관리자(SV) 질의 접수"},
                             "style": "primary",
                             "action_id": "open_inquiry_modal_btn",
                             "value": target_ts
@@ -428,53 +419,25 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 백그라운드 작업 처리 함수들 (500 에러 원천 차단)
-def bg_open_modal(trigger_id: str, channel_id: str, thread_ts: str, user_id: str, default_name: str):
-    if not slack_client:
-        return
-    user_name = default_name
-    try:
-        u_res = slack_client.users_info(user=user_id)
-        if u_res.get("ok"):
-            user_name = u_res.get("user", {}).get("real_name", default_name)
-    except Exception as e:
-        print(f"⚠️ users_info 조회 생략: {e}")
-
-    modal_payload = build_modal_view(trigger_id, channel_id, thread_ts, user_name)
-    try:
-        api_res = slack_client.views_open(**modal_payload)
-        if not api_res.get("ok"):
-            print(f"❌ views.open API 실패 사유: {api_res.get('error')}")
-    except Exception as e:
-        print(f"❌ views.open 호출 예외: {e}")
-
-def bg_dismiss_inquiry(channel_id: str, thread_ts: str, user_id: str):
-    if slack_client and channel_id and thread_ts:
-        try:
-            slack_client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다. 오늘도 화이팅하세요! ✨"
-            )
-        except Exception as e:
-            print(f"⚠️ dismiss 메시지 발송 실패: {e}")
-
+# 12. 모달 제출 후 시트 처리 백그라운드 태스크
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
 
-    team = values.get("team_block", {}).get("team_select", {}).get("selected_option", {}).get("value", "미지정")
+    team = values.get("team_block", {}).get("team_input", {}).get("value", "")
+    author = values.get("author_block", {}).get("author_input", {}).get("value", "")
     contract = values.get("contract_block", {}).get("contract_input", {}).get("value", "")
-    customer_name = values.get("customer_block", {}).get("customer_input", {}).get("value", "")
-    customer_q = values.get("customer_inquiry_block", {}).get("customer_inquiry_input", {}).get("value", "")
-    my_q = values.get("counselor_inquiry_block", {}).get("counselor_inquiry_input", {}).get("value", "")
+    name = values.get("name_block", {}).get("name_input", {}).get("value", "")
+    customer_q = values.get("customerQ_block", {}).get("customerQ_input", {}).get("value", "")
+    my_q = values.get("myQ_block", {}).get("myQ_input", {}).get("value", "")
 
+    # Apps Script 엔드포인트 규격과 100% 일치
     sheet_payload = {
         "action": "escalate",
         "team": team,
-        "author": meta.get("user_name"),
+        "author": author,
         "contract": contract,
-        "name": customer_name,
+        "name": name,
         "customerQ": customer_q,
         "myQ": my_q
     }
@@ -492,12 +455,12 @@ def bg_process_submission(view: dict):
             slack_client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=f"✅ *팀장 질의서가 양평센터 대장에 등록되었습니다.*\n• *소속:* {team} | *회원명:* {customer_name}\n• *질의 요약:* {my_q}"
+                text=f"✅ *관리자(SV) 질의서가 접수 대장에 등록되었습니다.*\n• *소속:* {team} | *작성자:* {author} | *회원명:* {name}\n• *질의 내용:* {my_q}"
             )
         except Exception as e:
             print(f"⚠️ 완료 알림 실패: {e}")
 
-# 13. Slack Interactivity 엔드포인트 (선응답 후 비동기 처리)
+# 13. Slack Interactivity 엔드포인트
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -514,21 +477,41 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 action_id = action.get("action_id")
                 raw_val = action.get("value", "")
 
+                # [관리자(SV) 질의 접수] 클릭 시 모달 열기
                 if action_id == "open_inquiry_modal_btn":
                     trigger_id = payload.get("trigger_id")
                     channel_id = payload.get("channel", {}).get("id")
                     user_info = payload.get("user", {})
                     user_id = user_info.get("id")
-                    user_name = user_info.get("name", "상담사")
+                    user_name = user_info.get("name", "")
 
-                    # 백그라운드로 모달 오픈 위임 (3초 타임아웃 500 방지)
-                    background_tasks.add_task(bg_open_modal, trigger_id, channel_id, raw_val, user_id, user_name)
+                    if slack_client:
+                        try:
+                            u_res = slack_client.users_info(user=user_id)
+                            user_name = u_res.get("user", {}).get("real_name", user_name)
+                        except Exception:
+                            pass
+
+                        modal_view = build_modal_view_dict(channel_id, raw_val, user_name)
+                        api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
+                        if not api_res.get("ok"):
+                            print(f"❌ views.open 실패: {api_res.get('error')}")
+
                     return Response(status_code=200)
 
+                # [질의서 작성 안 함] 클릭 시
                 elif action_id == "dismiss_inquiry_btn":
                     channel_id = payload.get("channel", {}).get("id")
                     user_id = payload.get("user", {}).get("id")
-                    background_tasks.add_task(bg_dismiss_inquiry, channel_id, raw_val, user_id)
+                    if slack_client and channel_id:
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=channel_id,
+                                thread_ts=raw_val,
+                                text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다. 오늘도 화이팅하세요! ✨"
+                            )
+                        except Exception as e:
+                            print(f"⚠️ dismiss 메시지 발송 실패: {e}")
                     return Response(status_code=200)
 
         # 2) 모달 제출
@@ -536,11 +519,10 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
             view = payload.get("view", {})
             if view.get("callback_id") == "submit_inquiry_modal":
                 background_tasks.add_task(bg_process_submission, view)
-                # 모달 닫기 지시 반환
                 return JSONResponse(content={"response_action": "clear"})
 
     except Exception as err:
-        print(f"❌ interactive 처리 예외: {err}")
+        print(f"❌ interactive 엔드포인트 예외: {err}")
         return Response(status_code=200)
 
     return Response(status_code=200)
