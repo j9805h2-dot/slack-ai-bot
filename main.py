@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import time
+import base64
 from collections import OrderedDict
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -30,7 +31,7 @@ api_key_index = 0
 print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 
 # =========================================================================
-# 3. 지식 베이스 연동 설정 (마스터 시트 + 💢대성_질의 시트 실시간 보정 연동)
+# 3. 지식 베이스 연동 설정 (마스터 시트 + 실시간 관리자 보정 연동)
 # =========================================================================
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv"
@@ -116,7 +117,7 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
 def convert_to_slack_markdown(text: str) -> str:
     return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
 
-# 5. Gemini API 호출 함수
+# 5. Gemini API 호출 함수 (실시간 상담 질의 응답용)
 def call_gemini_api(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
@@ -128,7 +129,7 @@ def call_gemini_api(prompt: str) -> str:
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
     }
 
-    active_models = ["gemini-flash-latest", "gemini-3-flash-preview", "gemini-3.5-flash", "gemini-pro-latest"]
+    active_models = ["gemini-flash-latest", "gemini-2.0-flash", "gemini-pro-latest"]
     max_attempts = len(GEMINI_API_KEYS)
     last_error_msg = ""
 
@@ -390,11 +391,10 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
 
 # =========================================================================
-# 💡 [핵심 추가] EC2 기반 Gemini 드라이브 파일 고속 OCR & 마스터 시트 적재
+# 💡 [404 에러 방지 모델 폴백 적용] Gemini 드라이브 파일 고속 OCR & 파싱
 # =========================================================================
 def parse_file_with_gemini(file_bytes: bytes, mime_type: str, file_name: str) -> str:
-    """Gemini Multimodal API를 사용하여 PDF/이미지/PPTX 본문 및 Q&A 규정을 고속 추출"""
-    import base64
+    """Gemini Multimodal API를 사용하여 PDF/이미지/PPTX 본문 및 규정을 추출"""
     global api_key_index
     if not GEMINI_API_KEYS:
         return ""
@@ -402,8 +402,8 @@ def parse_file_with_gemini(file_bytes: bytes, mime_type: str, file_name: str) ->
     b64_data = base64.b64encode(file_bytes).decode('utf-8')
     prompt = f"""
 이 파일('{file_name}')은 보람상조 양평센터 상담원을 위한 사내 업무 매뉴얼 및 규정 자료입니다.
-문서 내용을 꼼꼼히 분석하여 상담원들이 고객 문의 시 참고할 수 있도록 주요 규정, 절차, Q&A 내용을 상세하고 구조화된 텍스트로 요약/추출해 주세요.
-불필요한 서식이나 디자인 설명은 제외하고, 실무 규칙과 단계별 프로세스 위주로 정리하세요.
+문서 내용을 꼼꼼히 분석하여 상담원들이 고객 문의 시 참고할 수 있도록 주요 규정, 절차, Q&A 내용을 상세하고 구조화된 텍스트로 추출 및 정리해 주세요.
+불필요한 서식 설명은 제외하고, 실무 규칙과 단계별 프로세스 위주로 작성하세요.
 """
     headers = {"Content-Type": "application/json"}
     payload = {
@@ -416,17 +416,22 @@ def parse_file_with_gemini(file_bytes: bytes, mime_type: str, file_name: str) ->
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096}
     }
 
+    # 404 에러 방지를 위해 최신 공식 모델 순차 호출
+    candidate_models = ["gemini-flash-latest", "gemini-2.0-flash", "gemini-pro-latest"]
     current_key = GEMINI_API_KEYS[api_key_index]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={current_key}"
-    try:
-        res = requests.post(url, headers=headers, json=payload, timeout=60)
-        if res.status_code == 200:
-            data = res.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            print(f"⚠️ Gemini 파싱 실패 ({file_name}): {res.status_code} - {res.text[:100]}")
-    except Exception as e:
-        print(f"❌ Gemini 파싱 예외 ({file_name}): {e}")
+
+    for model_name in candidate_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={current_key}"
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=60)
+            if res.status_code == 200:
+                data = res.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            elif res.status_code != 404:
+                print(f"⚠️ Gemini 응답 오류 ({file_name}, {model_name}): {res.status_code} - {res.text[:100]}")
+        except Exception as e:
+            print(f"❌ Gemini 파싱 예외 ({file_name}, {model_name}): {e}")
+
     return ""
 
 def bg_process_drive_sync(payload: dict):
@@ -438,13 +443,11 @@ def bg_process_drive_sync(payload: dict):
     if not b64_contents:
         return
 
-    import base64
     file_bytes = base64.b64decode(b64_contents)
     print(f"🚀 [EC2 Gemini 분석 시작] {file_name} ({len(file_bytes)} bytes)")
 
     extracted_text = parse_file_with_gemini(file_bytes, mime_type, file_name)
     if extracted_text and DAESEONG_QNA_WEBAPP_URL:
-        # Apps Script 웹앱으로 분석 결과를 전달하여 마스터 시트에 최종 적재
         save_payload = {
             "action": "append_master_knowledge",
             "title": f"[{file_name}] 사내 업무 규정",
@@ -459,12 +462,14 @@ def bg_process_drive_sync(payload: dict):
 
 @app.post("/sync/drive-file")
 async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
-    """Apps Script에서 호출하는 엔드포인트: 무거운 파일은 EC2 백그라운드 태스크로 넘김"""
+    """Apps Script에서 호출하는 엔드포인트: 파일 분석 백그라운드 태스크 등록"""
     data = await request.json()
     background_tasks.add_task(bg_process_drive_sync, data)
     return {"status": "accepted", "message": f"{data.get('fileName')} Gemini 분석 백그라운드 작업 등록 완료"}
 
-# 11. Slack Events 엔드포인트
+# =========================================================================
+# 7. Slack Events 엔드포인트
+# =========================================================================
 PROCESSED_EVENT_IDS = OrderedDict()
 
 @app.post("/slack/events")
@@ -496,7 +501,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 모달 제출 처리
+# 8. 모달 제출 처리
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -540,7 +545,7 @@ def bg_process_submission(view: dict):
         except Exception as e:
             print(f"⚠️ 완료 알림 실패: {e}")
 
-# 13. Slack Interactivity 엔드포인트
+# 9. Slack Interactivity 엔드포인트
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request, background_tasks: BackgroundTasks):
     try:
