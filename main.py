@@ -95,7 +95,7 @@ refresh_all_knowledge()
 def normalize_text(text: str) -> str:
     return re.sub(r'[\s\-_/&]+', '', text.lower())
 
-def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
+def search_relevant_knowledge(query: str, top_k: int = 4) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
     if time.time() - LAST_SYNC_TIME > 120:
         refresh_all_knowledge()
@@ -125,10 +125,26 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     }
 
 def convert_to_slack_markdown(text: str) -> str:
-    return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    """가독성 개선: 지저분한 인용 태그 제거 및 뭉쳐진 항목 강제 줄바꿈"""
+    # 1. 인용 태그 () 완전 제거
+    text = re.sub(r'\[cite:[^\]]+\]', '', text)
+    
+    # 2. 마크다운 헤더(###, ####) 기호 정리
+    text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)
+
+    # 3. 마크다운 볼드 슬랙 변환 (** -> *)
+    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+
+    # 4. 엔터 없이 뭉쳐있는 불릿(•, -, *) 및 숫자 번호 앞에 빈 줄(개행 2개) 강제 삽입
+    text = re.sub(r'([^\n])\s*([•\*\-]\s+)', r'\1\n\n\2', text)
+    text = re.sub(r'([^\n])\s*(\d+\.\s+)', r'\1\n\n\2', text)
+    
+    # 5. 불필요하게 3개 이상 연속된 줄바꿈을 2개로 압축
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
 
 def call_gemini_api(prompt: str) -> str:
-    """토큰 한도를 3500으로 확장하여 문장 잘림을 방지하고 지원 모델 우선 호출"""
     global api_key_index
     if not GEMINI_API_KEYS:
         return "⚠️ 등록된 Gemini API 키가 없습니다."
@@ -138,13 +154,13 @@ def call_gemini_api(prompt: str) -> str:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2, 
-            "maxOutputTokens": 3500  # 💡 잘림 방지를 위해 3500으로 대폭 확장
+            "maxOutputTokens": 3500
         }
     }
 
     # 계정 지원 목록 기반 우선순위
     active_models = [
-        "gemini-3.5-flash-lite",      # 일일 500회 넉넉한 초고속 모델
+        "gemini-3.5-flash-lite",      # 일일 500회 초고속 모델
         "gemini-3.6-flash",           # 최신 플래시 백업
         "gemini-flash-lite-latest"    # 공식 안정화 alias
     ]
@@ -179,7 +195,7 @@ def call_gemini_api(prompt: str) -> str:
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(원인: {last_error_msg[:100]})"
 
 # =========================================================================
-# 💡 [핵심] 100% 로컬 텍스트 추출 (Gemini API 미호출 -> 429 원천 차단)
+# 💡 로컬 텍스트 추출 (Gemini 미호출 -> 429 원천 방지)
 # =========================================================================
 def extract_text_locally(file_bytes: bytes, file_name: str) -> str:
     lower = file_name.lower()
@@ -273,12 +289,9 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
         return "", "", 1
 
 def check_casual_intent(text: str) -> bool:
-    """
-    업무 관련 의문형 질문은 절대 일상대화로 빠지지 않도록 엄격 필터링
-    """
+    """업무 관련 의문형 질문은 절대 일상대화로 빠지지 않도록 처리"""
     clean = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
 
-    # 1. 의문사나 물음형 키워드가 하나라도 있으면 무조건 업무 질의로 처리
     inquiry_indicators = [
         "?", "？", "있어", "있나요", "되나요", "인가요", "할까", "어때", "어떻게", 
         "알려줘", "설명해", "기준", "제한", "연령", "나이", "금액", "환급", "해약", 
@@ -287,7 +300,6 @@ def check_casual_intent(text: str) -> bool:
     if any(k in text.lower() for k in inquiry_indicators):
         return False
 
-    # 2. 순수 일상 인사 및 감탄 키워드만 제한적으로 허용
     pure_casual = [
         "안녕", "하이", "헬로", "좋은아침", "굿모닝", "퇴근", "출근",
         "고마워", "감사", "땡큐", "수고", "고생", "화이팅", "파이팅",
@@ -385,7 +397,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
 
-    # 1. 일상 인사 필터링 (업무 질문은 통과)
+    # 일상 인사 처리
     if check_casual_intent(clean_prompt):
         casual_prompt = f"상담원의 일상 인사에 친절하고 다정하게 1~2문장으로 짧게 답해주세요. 상담원: '{clean_prompt}'"
         answer = call_gemini_api(casual_prompt)
@@ -419,10 +431,10 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
-        # 💡 [핵심] 신뢰도 점수(Confidence Score) 기반 투-트랙 프롬프트
+        # 💡 [핵심] 줄바꿈 강제 + 친근한 이모지 + 투-트랙 신뢰도 프롬프트
         system_instruction = f"""
-당신은 보람상조 양평센터 상담원들을 지원하는 전문 사내 AI 어시스턴트입니다.
-제공된 사내 규정과 지침을 바탕으로 정확하고 완결된 답변을 작성하세요.
+당신은 보람상조 양평센터 상담원들을 지원하는 다정하고 명쾌한 사내 AI 어시스턴트입니다.
+상담원이 콜 진행 중 2초 안에 바로 읽을 수 있도록 **줄글로 길게 늘어놓지 말고, 반드시 항목마다 엔터(줄바꿈)를 2번 쳐서 시원하게** 요약 답변하세요.
 
 {corrected_context}
 
@@ -435,14 +447,33 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [질문]:
 {clean_prompt}
 
-[답변 생성 원칙 - 엄격 준수]:
-1. **신뢰도 평가 (Confidence Score)**:
-   - 규정 지식에 명확한 근거(나이, 금액, 서류 등)가 확실히 있는 경우: 첫 줄에 `[신뢰도: 높음]` 표기
-   - 규정에 일부만 언급되어 유추가 필요한 경우: 첫 줄에 `[신뢰도: 보통]` 표기
-   - 규정에 아예 언급이 없거나, 사실과 다른 가정이 포함되었거나, 불확실한 경우: 첫 줄에 `[신뢰도: 낮음 (관리자 확인 필요)]` 표기
-2. **거짓 정보 생성 금지**: 규정에 없는 가입 연령 제한, 건강 상태 제한 등을 임의로 지어내지 마세요. 모르는 내용은 솔직히 "규정상 명시되지 않아 관리자 확인이 필요합니다"라고 안내하세요.
-3. **완결성 유지**: 문장 끝부분이 뚝 끊기지 않도록 모든 불릿 포인트와 문장을 마침표까지 완벽히 끝맺으세요. 불필요한 미사여구는 배제하고 실무 핵심만 작성하세요.
-4. 관리자 보정 지침이 있으면 최우선으로 적용하세요.
+[답변 형식 및 가독성 규칙 - 엄격 준수]:
+1. **첫 줄 신뢰도 표기**:
+   - 확실한 규정 근거: `[신뢰도: 높음 🟢]`
+   - 규정 없음/불확실: `[신뢰도: 낮음 (관리자 확인 필요) 🔴]`
+   (신뢰도 표기 후 반드시 엔터를 2번 쳐서 아래 내용과 띄우세요.)
+
+2. **핵심 결론**:
+   - 첫머리에 결론을 1줄로 친근하고 명확하게 제시하세요. (예: 📌 *비앤케어팩은 가입 나이에 별도의 제한이 없어요!*)
+   - 인용 표기(cite 등)나 서론 인사말은 일체 넣지 마세요.
+
+3. **세부 요건 (항목 간 반드시 빈 줄 1개씩 띄우기)**:
+   - 복잡한 설명 대신 핵심 3~4가지만 불릿(•)으로 작성하세요.
+   - 각 불릿 항목 사이에는 **반드시 줄바꿈을 2번(\n\n)** 넣으세요. 한 줄로 이어붙이지 마세요.
+   - 문장 끝은 "~해요", "~해 주시면 됩니다 😊"처럼 다정하고 전문적으로 맺으세요.
+
+[답변 출력 양식 예시]:
+[신뢰도: 높음 🟢]
+
+📌 *비앤케어팩은 가입 나이에 별도의 제한이 없습니다!*
+
+• 👤 *연령 기준*: 고령자도 누구나 가입 가능해요. (단, 미성년자는 법정대리인 녹취 및 서류 필수)
+
+• 🔢 *구좌 수*: 1인당 최대 2구좌까지만 가입 가능해요.
+
+• 🛍️ *가입 조건*: 삼성스토어 가전 구매 고객 대상 결합 상품이에요.
+
+💡 *상담 팁*: 고객님이 나이 제한을 걱정하시면 "연령 제한 없이 안심하고 가입 가능하다"고 안내해 드리면 좋아요! ✨
 """
         raw_answer = call_gemini_api(system_instruction)
         
@@ -464,7 +495,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception:
             pass
 
-        # 텍스트가 2800자를 넘을 경우 블록 분할 전송 (슬랙 3,000자 제한 방어)
+        # 슬랙 3000자 블록 제한 방어
         text_chunks = [answer[i:i+2800] for i in range(0, len(answer), 2800)]
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in text_chunks]
 
