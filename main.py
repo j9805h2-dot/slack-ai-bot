@@ -29,16 +29,22 @@ for k, v in os.environ.items():
 api_key_index = 0
 print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 
-# 3. 구글 스프레드시트 지식 베이스
+# =========================================================================
+# 3. 지식 베이스 연동 설정 (마스터 시트 + 💢대성_질의 시트 실시간 보정 연동)
+# =========================================================================
+# 1) 마스터 규정 지식 베이스 (📚AI_마스터지식)
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv"
-LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL", "")
 
-KNOWLEDGE_CACHE = []
-CORRECTED_CACHE = []
+# 2) 💢대성_질의 시트 전용 Apps Script 웹앱 URL (로그 저장 및 실시간 보정 데이터 수신용)
+DAESEONG_QNA_WEBAPP_URL = os.environ.get("DAESEONG_WEBAPP_URL") or os.environ.get("LOG_WEBHOOK_URL", "")
+
+KNOWLEDGE_CACHE = []      # 마스터 시트 규정 지식
+CORRECTED_CACHE = []      # 💢대성_질의 시트의 관리자 보정 피드백 (최우선 적용)
 LAST_SYNC_TIME = 0
 
 def fetch_master_knowledge():
+    """📚AI_마스터지식 시트의 전체 규정 로드"""
     global KNOWLEDGE_CACHE
     try:
         res = requests.get(SHEET_CSV_URL, timeout=10)
@@ -52,29 +58,37 @@ def fetch_master_knowledge():
             {header[i].strip(): row[i].strip() for i in range(min(len(header), len(row)))}
             for row in rows[1:] if any(row)
         ]
-        print(f"✅ 마스터 지식 로드 완료: {len(KNOWLEDGE_CACHE)}건")
+        print(f"✅ [1/2] 📚AI_마스터지식 로드 완료: {len(KNOWLEDGE_CACHE)}건")
     except Exception as e:
-        print(f"❌ 마스터 지식 로드 실패: {e}")
+        print(f"❌ 📚AI_마스터지식 로드 실패: {e}")
 
 def fetch_corrected_knowledge():
+    """💢대성_질의 시트(💬실시간_질의로그 + 📋상담사 질의)의 관리자 실시간 보정 데이터 로드"""
     global CORRECTED_CACHE
-    if not LOG_WEBHOOK_URL:
+    if not DAESEONG_QNA_WEBAPP_URL:
+        print("⚠️ 💢대성_질의 웹앱 URL(LOG_WEBHOOK_URL)이 설정되지 않았습니다.")
         return
     try:
-        res = requests.get(LOG_WEBHOOK_URL, timeout=10)
+        # Apps Script의 doGet()을 실행하여 시트 내 최신 보정 데이터를 JSON으로 가져옵니다.
+        res = requests.get(DAESEONG_QNA_WEBAPP_URL, timeout=12)
         if res.status_code == 200:
             data = res.json()
             CORRECTED_CACHE = data.get("data", [])
-            print(f"✅ 실시간 보정 지식 로드 완료: {len(CORRECTED_CACHE)}건")
+            print(f"✅ [2/2] 💢대성_질의 실시간 관리자 보정 지식 로드 완료: {len(CORRECTED_CACHE)}건")
+        else:
+            print(f"⚠️ 💢대성_질의 보정 지식 요청 비정상 응답 코드: {res.status_code}")
     except Exception as e:
-        print(f"⚠️ 보정 지식 로드 실패: {e}")
+        print(f"⚠️ 💢대성_질의 실시간 보정 지식 통신 실패: {e}")
 
 def refresh_all_knowledge():
+    """60초 주기로 마스터 규정과 💢대성_질의 시트 보정 내용을 실시간 동기화"""
     global LAST_SYNC_TIME
+    print("\n🔄 지식 베이스 실시간 갱신 시작...")
     fetch_master_knowledge()
     fetch_corrected_knowledge()
     LAST_SYNC_TIME = time.time()
 
+# 봇 구동 시 1차 즉시 로드
 refresh_all_knowledge()
 
 def normalize_text(text: str) -> str:
@@ -82,6 +96,8 @@ def normalize_text(text: str) -> str:
 
 def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
+    
+    # 마지막 동기화로부터 60초가 지나면 💢대성_질의 시트의 보정 데이터를 자동으로 다시 긁어옴
     if time.time() - LAST_SYNC_TIME > 60:
         refresh_all_knowledge()
 
@@ -105,8 +121,8 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
         return [it for _, it in results[:top_k]]
 
     return {
-        "corrected_rules": score_items(CORRECTED_CACHE),
-        "master_rules": score_items(KNOWLEDGE_CACHE)
+        "corrected_rules": score_items(CORRECTED_CACHE),  # 1순위 관리자 보정 지침
+        "master_rules": score_items(KNOWLEDGE_CACHE)       # 2순위 기본 규정 지식
     }
 
 # 4. 볼드체 변환 유틸
@@ -179,7 +195,7 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
 def check_casual_intent(text: str) -> bool:
     clean = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
     
-    # 🚨 업무 및 규정 질문 키워드는 절대 일상 대화로 오인하지 않음
+    # 🚨 업무 및 규정 질문 키워드는 절대 일상 대화로 빠지지 않음
     business_keywords = [
         "본인확인", "확인해야", "확인방법", "연체", "해약", "환급", "양도", 
         "명의", "프로세스", "절차", "서류", "발급", "신청", "인증", "기준", "어떻게"
@@ -205,10 +221,10 @@ def check_manual_escalation_intent(text: str) -> bool:
 
 # 8. 질의로그 시트 전송
 def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, sub_q: str, answer: str):
-    if not LOG_WEBHOOK_URL:
+    if not DAESEONG_QNA_WEBAPP_URL:
         return
     try:
-        requests.post(LOG_WEBHOOK_URL, json={
+        requests.post(DAESEONG_QNA_WEBAPP_URL, json={
             "action": "log",
             "gubun": gubun,
             "thread_ts": thread_ts,
@@ -367,6 +383,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
         knowledge = search_relevant_knowledge(search_target)
 
+        # 🚨 💢대성_질의 시트에서 가져온 관리자 보정 지침을 프롬프트 최상단에 1순위로 배치
         corrected_context = ""
         if knowledge.get('corrected_rules'):
             corrected_context = f"""
@@ -514,9 +531,9 @@ def bg_process_submission(view: dict):
         "slack_thread_key": f"{channel_id}|{thread_ts}"
     }
 
-    if LOG_WEBHOOK_URL:
+    if DAESEONG_QNA_WEBAPP_URL:
         try:
-            requests.post(LOG_WEBHOOK_URL, json=sheet_payload, timeout=5)
+            requests.post(DAESEONG_QNA_WEBAPP_URL, json=sheet_payload, timeout=5)
         except Exception as e:
             print(f"⚠️ 대장 전송 실패: {e}")
 
