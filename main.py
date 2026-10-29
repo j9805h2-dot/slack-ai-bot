@@ -126,22 +126,12 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
 
 def convert_to_slack_markdown(text: str) -> str:
     """가독성 개선: 지저분한 인용 태그 제거 및 뭉쳐진 항목 강제 줄바꿈"""
-    # 1. 인용 태그 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
-    
-    # 2. 마크다운 헤더(###, ####) 기호 정리
     text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)
-
-    # 3. 마크다운 볼드 슬랙 변환 (** -> *)
     text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
-
-    # 4. 엔터 없이 뭉쳐있는 불릿(•, -, *) 및 숫자 번호 앞에 빈 줄(개행 2개) 강제 삽입
     text = re.sub(r'([^\n])\s*([•\*\-]\s+)', r'\1\n\n\2', text)
     text = re.sub(r'([^\n])\s*(\d+\.\s+)', r'\1\n\n\2', text)
-    
-    # 5. 불필요하게 3개 이상 연속된 줄바꿈을 2개로 압축
     text = re.sub(r'\n{3,}', '\n\n', text)
-
     return text.strip()
 
 def call_gemini_api(prompt: str) -> str:
@@ -158,11 +148,10 @@ def call_gemini_api(prompt: str) -> str:
         }
     }
 
-    # 계정 지원 목록 기반 우선순위
     active_models = [
-        "gemini-3.5-flash-lite",      # 일일 500회 초고속 모델
-        "gemini-3.6-flash",           # 최신 플래시 백업
-        "gemini-flash-lite-latest"    # 공식 안정화 alias
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-flash-lite-latest"
     ]
     max_attempts = len(GEMINI_API_KEYS) * len(active_models)
     last_error_msg = ""
@@ -194,9 +183,6 @@ def call_gemini_api(prompt: str) -> str:
 
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(원인: {last_error_msg[:100]})"
 
-# =========================================================================
-# 로컬 텍스트 추출 (Gemini 미호출 -> 429 원천 방지)
-# =========================================================================
 def extract_text_locally(file_bytes: bytes, file_name: str) -> str:
     lower = file_name.lower()
     text = ""
@@ -259,9 +245,6 @@ async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(bg_process_drive_sync, data)
     return {"status": "accepted", "message": f"{data.get('fileName')} 작업 등록 완료"}
 
-# =========================================================================
-# 슬랙 이벤트 & 인터랙션 처리 핸들러
-# =========================================================================
 def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
     if not slack_client or not thread_ts:
         return "", "", 1
@@ -289,9 +272,7 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
         return "", "", 1
 
 def check_casual_intent(text: str) -> bool:
-    """업무 관련 의문형 질문은 절대 일상대화로 빠지지 않도록 처리"""
     clean = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
-
     inquiry_indicators = [
         "?", "？", "있어", "있나요", "되나요", "인가요", "할까", "어때", "어떻게", 
         "알려줘", "설명해", "기준", "제한", "연령", "나이", "금액", "환급", "해약", 
@@ -397,7 +378,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
 
-    # 일상 인사 처리
     if check_casual_intent(clean_prompt):
         casual_prompt = f"상담원의 일상 인사에 친절하고 다정하게 1~2문장으로 짧게 답해주세요. 상담원: '{clean_prompt}'"
         answer = call_gemini_api(casual_prompt)
@@ -431,7 +411,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
-        # 💡 [핵심] 실무 상세도 보강 + 친근한 이모지 + 항목별 2단 줄바꿈 프롬프트
         system_instruction = f"""
 당신은 보람상조 양평센터 상담원들을 지원하는 꼼꼼하고 다정한 사내 전문 AI 어시스턴트입니다.
 상담원이 고객 통화 중 즉시 안내할 수 있도록 **핵심 결론을 먼저 제시하고, 연관된 세부 규정(가입 요건, 구비서류, 유의사항, 예외조건 등)을 충분하고 구체적으로 설명**하세요.
@@ -471,7 +450,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 """
         raw_answer = call_gemini_api(system_instruction)
         
-        # 신뢰도 분석: 낮음이거나 규정 부재 시 관리자 접수 버튼 자동 활성화 (투-트랙)
         is_low_confidence = "[신뢰도: 낮음" in raw_answer or "확인 필요" in raw_answer
         is_escalation_triggered = (user_q_count >= 3) or is_low_confidence
 
@@ -482,14 +460,12 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         else:
             answer = raw_answer
 
-    # 슬랙 발송 처리
     if slack_client:
         try:
             slack_client.reactions_remove(channel=channel, timestamp=ts, name="eyes")
         except Exception:
             pass
 
-        # 슬랙 3000자 블록 제한 방어
         text_chunks = [answer[i:i+2800] for i in range(0, len(answer), 2800)]
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in text_chunks]
 
@@ -567,9 +543,31 @@ def bg_process_submission(view: dict):
 
     channel_id = meta.get("channel_id")
     thread_ts = meta.get("thread_ts")
+    
     if slack_client and channel_id and thread_ts:
+        # 💡 [핵심 추가] 모달 제출 완료 시 기존 AI 메시지의 [질의 접수] 버튼 제거
         try:
-            slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~")
+            res = slack_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=1)
+            msgs = res.get("messages", [])
+            if msgs:
+                orig_text = msgs[0].get("text", "")
+                orig_ts = msgs[0].get("ts")
+                slack_client.chat_update(
+                    channel=channel_id,
+                    ts=orig_ts,
+                    text=orig_text,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": orig_text}}]
+                )
+        except Exception as e:
+            print(f"⚠️ 질의 버튼 제거 실패: {e}")
+
+        # 안내 문구 전송
+        try:
+            slack_client.chat_postMessage(
+                channel=channel_id, 
+                thread_ts=thread_ts, 
+                text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~"
+            )
         except Exception:
             pass
 
@@ -595,7 +593,6 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                     user_id = user_info.get("id")
                     user_name = user_info.get("name", "상담사")
 
-                    # 💡 [핵심] 영문 계정명(jh.lee) 대신 실제 슬랙 워크스페이스 프로필 이름(이재형SV 등) 추출
                     if slack_client and user_id:
                         try:
                             u_res = slack_client.users_info(user=user_id)
