@@ -133,7 +133,7 @@ def call_gemini_api(prompt: str) -> str:
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
     }
 
-    active_models = ["gemini-flash-latest", "gemini-2.0-flash"]
+    active_models = ["gemini-1.5-flash-latest", "gemini-flash-latest", "gemini-1.5-flash"]
     max_attempts = len(GEMINI_API_KEYS) * len(active_models)
     last_error_msg = ""
 
