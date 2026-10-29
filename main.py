@@ -126,7 +126,7 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
 
 def convert_to_slack_markdown(text: str) -> str:
     """가독성 개선: 지저분한 인용 태그 제거 및 뭉쳐진 항목 강제 줄바꿈"""
-    # 1. 인용 태그 ( 등) 제거
+    # 1. 인용 태그 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
     
     # 2. 마크다운 헤더(###, ####) 기호 정리
@@ -594,6 +594,16 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                     user_info = payload.get("user", {})
                     user_id = user_info.get("id")
                     user_name = user_info.get("name", "상담사")
+
+                    # 💡 [핵심] 영문 계정명(jh.lee) 대신 실제 슬랙 워크스페이스 프로필 이름(이재형SV 등) 추출
+                    if slack_client and user_id:
+                        try:
+                            u_res = slack_client.users_info(user=user_id)
+                            if u_res.get("ok"):
+                                profile = u_res.get("user", {}).get("profile", {})
+                                user_name = profile.get("display_name") or profile.get("real_name") or user_name
+                        except Exception as e:
+                            print(f"⚠️ 사용자 프로필 조회 실패: {e}")
 
                     if slack_client and trigger_id:
                         modal_view = build_modal_view_dict(channel_id, raw_val, user_name, user_id)
