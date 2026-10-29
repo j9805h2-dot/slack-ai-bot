@@ -133,7 +133,11 @@ def call_gemini_api(prompt: str) -> str:
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
     }
 
-    active_models = ["gemini-1.5-flash-latest", "gemini-flash-latest", "gemini-1.5-flash"]
+    active_models = [
+    "gemini-3-flash-preview",     # Gemini 3 Flash (남은 쿼터 우선 활용)
+    "gemini-3.5-flash-lite",      # Gemini 3.5 Flash Lite (일일 500회로 가장 넉넉함)
+    "gemini-2.5-flash"            # Gemini 2.5 Flash (백업)
+]
     max_attempts = len(GEMINI_API_KEYS) * len(active_models)
     last_error_msg = ""
 
