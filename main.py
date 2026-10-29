@@ -95,7 +95,7 @@ refresh_all_knowledge()
 def normalize_text(text: str) -> str:
     return re.sub(r'[\s\-_/&]+', '', text.lower())
 
-def search_relevant_knowledge(query: str, top_k: int = 4) -> dict:
+def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
     if time.time() - LAST_SYNC_TIME > 120:
         refresh_all_knowledge()
@@ -126,7 +126,7 @@ def search_relevant_knowledge(query: str, top_k: int = 4) -> dict:
 
 def convert_to_slack_markdown(text: str) -> str:
     """가독성 개선: 지저분한 인용 태그 제거 및 뭉쳐진 항목 강제 줄바꿈"""
-    # 1. 인용 태그 () 완전 제거
+    # 1. 인용 태그 ( 등) 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
     
     # 2. 마크다운 헤더(###, ####) 기호 정리
@@ -195,7 +195,7 @@ def call_gemini_api(prompt: str) -> str:
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(원인: {last_error_msg[:100]})"
 
 # =========================================================================
-# 💡 로컬 텍스트 추출 (Gemini 미호출 -> 429 원천 방지)
+# 로컬 텍스트 추출 (Gemini 미호출 -> 429 원천 방지)
 # =========================================================================
 def extract_text_locally(file_bytes: bytes, file_name: str) -> str:
     lower = file_name.lower()
@@ -425,16 +425,16 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         is_escalation_triggered = True
     else:
         search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
-        knowledge = search_relevant_knowledge(search_target, top_k=4)
+        knowledge = search_relevant_knowledge(search_target, top_k=5)
 
         corrected_context = ""
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
-        # 💡 [핵심] 줄바꿈 강제 + 친근한 이모지 + 투-트랙 신뢰도 프롬프트
+        # 💡 [핵심] 실무 상세도 보강 + 친근한 이모지 + 항목별 2단 줄바꿈 프롬프트
         system_instruction = f"""
-당신은 보람상조 양평센터 상담원들을 지원하는 다정하고 명쾌한 사내 AI 어시스턴트입니다.
-상담원이 콜 진행 중 2초 안에 바로 읽을 수 있도록 **줄글로 길게 늘어놓지 말고, 반드시 항목마다 엔터(줄바꿈)를 2번 쳐서 시원하게** 요약 답변하세요.
+당신은 보람상조 양평센터 상담원들을 지원하는 꼼꼼하고 다정한 사내 전문 AI 어시스턴트입니다.
+상담원이 고객 통화 중 즉시 안내할 수 있도록 **핵심 결론을 먼저 제시하고, 연관된 세부 규정(가입 요건, 구비서류, 유의사항, 예외조건 등)을 충분하고 구체적으로 설명**하세요.
 
 {corrected_context}
 
@@ -447,33 +447,27 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [질문]:
 {clean_prompt}
 
-[답변 형식 및 가독성 규칙 - 엄격 준수]:
+[답변 작성 및 가독성 규칙 - 엄격 준수]:
 1. **첫 줄 신뢰도 표기**:
-   - 확실한 규정 근거: `[신뢰도: 높음 🟢]`
-   - 규정 없음/불확실: `[신뢰도: 낮음 (관리자 확인 필요) 🔴]`
-   (신뢰도 표기 후 반드시 엔터를 2번 쳐서 아래 내용과 띄우세요.)
+   - 사내 규정에 명확한 근거가 있는 경우: `[신뢰도: 높음 🟢]`
+   - 규정 중 일부 유추/복합 확인이 필요한 경우: `[신뢰도: 보통 🟡]`
+   - 규정에 내용이 없거나 사실 확인이 필요한 경우: `[신뢰도: 낮음 (관리자 확인 필요) 🔴]`
+   (신뢰도 표기 직후 반드시 엔터를 2번 쳐서 아래 내용과 띄우세요.)
 
-2. **핵심 결론**:
-   - 첫머리에 결론을 1줄로 친근하고 명확하게 제시하세요. (예: 📌 *비앤케어팩은 가입 나이에 별도의 제한이 없어요!*)
-   - 인용 표기(cite 등)나 서론 인사말은 일체 넣지 마세요.
+2. **핵심 결론 (두괄식 안내)**:
+   - 질문에 대한 핵심 결론을 첫 문장에 1~2줄로 명쾌하고 친절하게 제시하세요.
+   - 불필요한 서론("질문 주셔서 감사합니다" 등)이나 인용 태그(cite 등)는 쓰지 마세요.
 
-3. **세부 요건 (항목 간 반드시 빈 줄 1개씩 띄우기)**:
-   - 복잡한 설명 대신 핵심 3~4가지만 불릿(•)으로 작성하세요.
-   - 각 불릿 항목 사이에는 **반드시 줄바꿈을 2번(\n\n)** 넣으세요. 한 줄로 이어붙이지 마세요.
-   - 문장 끝은 "~해요", "~해 주시면 됩니다 😊"처럼 다정하고 전문적으로 맺으세요.
+3. **상세 규정 및 실무 체크포인트 (충분한 설명 제공)**:
+   - 너무 지나치게 축약하지 말고, 상담원이 꼭 알아야 할 세부 항목(가입 기준, 구좌 수, 서류, 예외 조건 등)을 구체적인 불릿(•)으로 나누어 상세히 설명하세요.
+   - 각 불릿 항목 사이에는 **반드시 줄바꿈을 2번(\n\n)** 넣어 슬랙에서 줄글이 뭉치지 않게 하세요.
+   - 말투는 전문적이면서도 따뜻한 톤("~해 주셔야 해요 😊", "~가능합니다 ✨")을 유지하세요.
 
-[답변 출력 양식 예시]:
-[신뢰도: 높음 🟢]
+4. **실무 상담 팁 / 주의사항 (💡)**:
+   - 고객 응대 시 유용한 멘트나 전산 등록 시 주의해야 할 사항을 하단에 1~2줄 덧붙여 실무 활용도를 높이세요.
 
-📌 *비앤케어팩은 가입 나이에 별도의 제한이 없습니다!*
-
-• 👤 *연령 기준*: 고령자도 누구나 가입 가능해요. (단, 미성년자는 법정대리인 녹취 및 서류 필수)
-
-• 🔢 *구좌 수*: 1인당 최대 2구좌까지만 가입 가능해요.
-
-• 🛍️ *가입 조건*: 삼성스토어 가전 구매 고객 대상 결합 상품이에요.
-
-💡 *상담 팁*: 고객님이 나이 제한을 걱정하시면 "연령 제한 없이 안심하고 가입 가능하다"고 안내해 드리면 좋아요! ✨
+5. **거짓 정보 금지**:
+   - 지식에 명시되지 않은 내용은 추측하지 말고 솔직하게 "해당 사항은 규정에 명시되어 있지 않아 SV 확인을 권장드립니다"라고 안내하세요.
 """
         raw_answer = call_gemini_api(system_instruction)
         
