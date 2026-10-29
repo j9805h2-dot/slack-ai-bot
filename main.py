@@ -571,7 +571,7 @@ def bg_process_submission(view: dict):
                 slack_client.chat_postMessage(
                     channel=channel_id, 
                     thread_ts=thread_ts, 
-                    text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~"
+                    text="🤖전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~"
                 )
             except Exception:
                 pass
