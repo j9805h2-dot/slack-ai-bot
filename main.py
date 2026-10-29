@@ -45,7 +45,7 @@ api_key_index = 0
 print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
-SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv"
+SHEET_CSV_URL = f"[https://docs.google.com/spreadsheets/d/](https://docs.google.com/spreadsheets/d/){MASTER_SHEET_ID}/export?format=csv"
 DAESEONG_QNA_WEBAPP_URL = os.environ.get("DAESEONG_WEBAPP_URL") or os.environ.get("LOG_WEBHOOK_URL", "")
 
 KNOWLEDGE_CACHE = []
@@ -125,20 +125,23 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     }
 
 def convert_to_slack_markdown(text: str) -> str:
-    """가독성 개선: 인용 태그 제거, 쪼개진 외톨이 마크다운 기호 및 과도한 빈 줄 정리"""
-    # 1. 인용 태그 제거
+    """가독성 개선: 인용 태그 제거, 표준 마크다운 볼드(**)를 슬랙 볼드(*)로 변환, 불필요한 줄바꿈 정리"""
+    # 1. AI 인용 태그 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
     
-    # 2. 마크다운 헤더(###, ####) 기호 볼드 처리
+    # 2. 마크다운 볼드(**텍스트**)를 슬랙 볼드(*텍스트*)로 변환
+    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+
+    # 3. 마크다운 헤더(###, ####) 기호 슬랙 볼드 처리
     text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)
 
-    # 3. 불필요한 마크다운 수평선(---, ***) 제거 (줄바꿈 테러 방지)
+    # 4. 불필요한 수평선(---, ***) 제거
     text = re.sub(r'^[ \t]*[-*_]{3,}[ \t]*$', '', text, flags=re.MULTILINE)
 
-    # 4. 외톨이로 홀로 떨어진 특수문자(-, *, • 등) 단독 줄 제거
+    # 5. 외톨이 특수문자 단독 줄 제거
     text = re.sub(r'^[ \t]*[•\*\-]{1,2}[ \t]*$', '', text, flags=re.MULTILINE)
 
-    # 5. 연속된 3개 이상의 빈 줄을 최대 1개의 빈 줄(개행 2개)로 압축
+    # 6. 연속된 3개 이상의 개행을 2개로 압축 (단락 간 자연스러운 1줄 공백 유지)
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -168,7 +171,7 @@ def call_gemini_api(prompt: str) -> str:
     for _ in range(max_attempts):
         current_key = GEMINI_API_KEYS[api_key_index]
         for model in active_models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}"
+            url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model}:generateContent?key={current_key}"
             try:
                 res = requests.post(url, headers=headers, json=payload, timeout=25)
                 if res.status_code == 200:
@@ -421,10 +424,10 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
-        # 💡 [개선] 과도한 2단 줄바꿈 강제 제거 및 자연스러운 단락 정돈 프롬프트
+        # 💡 [핵심] 볼드, 인용구(>), 인라인 코드(`)를 적극 활용하도록 구성한 슬랙 고가독성 프롬프트
         system_instruction = f"""
 당신은 보람상조 양평센터 상담원들을 지원하는 꼼꼼하고 다정한 사내 전문 AI 어시스턴트입니다.
-상담원이 고객 통화 중 즉시 안내할 수 있도록 **핵심 결론을 먼저 제시하고, 연관된 세부 규정(가입 요건, 구비서류, 유의사항, 예외조건 등)을 충분하고 구체적으로 설명**하세요.
+상담원이 고객 통화 중 즉시 안내할 수 있도록 가독성이 뛰어난 슬랙 서식(볼드, 인용구, 인라인 코드)을 활용하여 핵심을 명확히 전달하세요.
 
 {corrected_context}
 
@@ -437,27 +440,30 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [질문]:
 {clean_prompt}
 
-[답변 작성 및 가독성 규칙 - 엄격 준수]:
+[답변 작성 및 가독성 서식 규칙 - 엄격 준수]:
 1. **첫 줄 신뢰도 표기**:
    - 사내 규정에 명확한 근거가 있는 경우: `[신뢰도: 높음 🟢]`
    - 규정 중 일부 유추/복합 확인이 필요한 경우: `[신뢰도: 보통 🟡]`
    - 규정에 내용이 없거나 사실 확인이 필요한 경우: `[신뢰도: 낮음 (관리자 확인 필요) 🔴]`
+   (신뢰도 바로 다음 줄에는 빈 줄 1개를 띄우세요.)
 
-2. **핵심 결론 (두괄식 안내)**:
-   - 질문에 대한 핵심 결론을 첫머리에 1~2줄로 명쾌하고 친절하게 제시하세요.
-   - 서론("질문 주셔서 감사합니다" 등)이나 인용 태그(cite 등)는 일체 쓰지 마세요.
+2. **핵심 결론 (두괄식 안내 - 인용구 및 볼드 활용)**:
+   - 질문에 대한 핵심 결론은 **반드시 인용구(`>`) 기호**로 시작하고, 중요 결론 부분은 `*볼드체*`로 강조하세요.
+   - 예시: `> *핵심 결론:* 본 상품은 만 19세부터 가입 가능하며, 최대 2구좌까지 신청할 수 있습니다. ✨`
+   - 불필요한 서론("질문 감사합니다", "상담원님" 등)이나 인용 태그(cite 등)는 쓰지 마세요.
 
-3. **상세 규정 및 실무 체크포인트**:
-   - 너무 축약하지 말고 상담원이 꼭 알아야 할 세부 항목(가입 기준, 구좌 수, 서류, 예외 조건 등)을 간결한 불릿(•)으로 정리하세요.
-   - 단락과 불릿 사이에는 자연스러운 공백(한 줄 띄움)만 유지하고, 불필요하게 빈 줄을 연달아 남발하지 마세요.
-   - 불필요한 마크다운 구분선(--- 등)은 절대 사용하지 마세요.
-   - 말투는 전문적이면서도 따뜻한 톤("~해 주셔야 해요 😊", "~가능합니다 ✨")을 유지하세요.
+3. **상세 규정 및 실무 체크포인트 (불릿 & 인라인 코드 활용)**:
+   - 각 세부 항목 앞에는 깔끔한 불릿(`•`)을 붙이고, 항목명은 `*항목명:*` 형태로 볼드 처리하세요.
+   - 계약명, 서류명, 전산 메뉴, URL, 구좌 수 등 중요 키워드는 `` `인라인 코드` ``로 감싸 한눈에 띄게 하세요.
+     (예시: `• *구비 서류:* 본인 확인을 위해 `신분증 사본` 및 `가족관계증명서`가 필요합니다.`)
+   - 단락과 불릿 사이에는 자연스럽게 1줄 공백만 유지하고, 불필요한 빈 줄을 남발하지 마세요.
+   - 수평선(`---`)은 일체 사용하지 마세요.
 
 4. **실무 상담 팁 / 주의사항 (💡)**:
-   - 고객 응대 시 유용한 멘트나 전산 주의사항을 하단에 간결하게 덧붙이세요.
+   - 고객 응대 시 주의점이나 전산 팁은 하단에 인용구(`> 💡 *실무 팁:* ...`) 형태로 1~2줄 덧붙여 실무 활용도를 높이세요.
 
 5. **거짓 정보 금지**:
-   - 지식에 명시되지 않은 내용은 추측하지 말고 솔직하게 "해당 사항은 규정에 명시되어 있지 않아 SV 확인을 권장드립니다"라고 안내하세요.
+   - 지식에 명시되지 않은 내용은 추측하지 말고 솔직하게 "해당 사항은 사내 규정에 명시되어 있지 않아 SV 확인을 권장드립니다"라고 안내하세요.
 """
         raw_answer = call_gemini_api(system_instruction)
         
@@ -465,9 +471,9 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         is_escalation_triggered = (user_q_count >= 3) or is_low_confidence
 
         if is_low_confidence:
-            answer = f"{raw_answer}\n\n⚠️ *주의*: 사내 규정에 명확한 기준이 없거나 예외 사항일 수 있습니다. 아래 버튼을 눌러 관리자(SV)에게 정확한 내용을 확인받으세요."
+            answer = f"{raw_answer}\n\n> ⚠️ *주의*: 사내 규정에 명확한 기준이 없거나 예외 사항일 수 있습니다. 아래 버튼을 눌러 관리자(SV)에게 정확한 내용을 확인받으세요."
         elif user_q_count >= 3:
-            answer = f"{raw_answer}\n\n*안내*: 추가 문의나 세부 확인이 필요하시면 아래 버튼으로 관리자 질의를 접수하세요."
+            answer = f"{raw_answer}\n\n> ℹ️ *안내*: 추가 문의나 세부 확인이 필요하시면 아래 버튼으로 관리자 질의를 접수하세요."
         else:
             answer = raw_answer
 
