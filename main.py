@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 
 # 로컬 텍스트 추출 라이브러리
 try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
@@ -92,7 +97,7 @@ def normalize_text(text: str) -> str:
 
 def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
-    if time.time() - LAST_SYNC_TIME > 60:
+    if time.time() - LAST_SYNC_TIME > 120:
         refresh_all_knowledge()
 
     cleaned_query = normalize_text(query)
@@ -105,10 +110,10 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
             item_str = " ".join([str(v) for v in item.values()])
             norm_str = normalize_text(item_str)
             if cleaned_query in norm_str:
-                score += 10
+                score += 15
             for t in tokens:
                 if normalize_text(t) in norm_str:
-                    score += 3
+                    score += 4
             if score > 0:
                 results.append((score, item))
         results.sort(key=lambda x: x[0], reverse=True)
@@ -123,6 +128,7 @@ def convert_to_slack_markdown(text: str) -> str:
     return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
 
 def call_gemini_api(prompt: str) -> str:
+    """토큰 한도를 3500으로 확장하여 문장 잘림을 방지하고 지원 모델 우선 호출"""
     global api_key_index
     if not GEMINI_API_KEYS:
         return "⚠️ 등록된 Gemini API 키가 없습니다."
@@ -130,14 +136,18 @@ def call_gemini_api(prompt: str) -> str:
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
+        "generationConfig": {
+            "temperature": 0.2, 
+            "maxOutputTokens": 3500  # 💡 잘림 방지를 위해 3500으로 대폭 확장
+        }
     }
 
+    # 계정 지원 목록 기반 우선순위
     active_models = [
-    "gemini-3-flash-preview",     # Gemini 3 Flash (남은 쿼터 우선 활용)
-    "gemini-3.5-flash-lite",      # Gemini 3.5 Flash Lite (일일 500회로 가장 넉넉함)
-    "gemini-2.5-flash"            # Gemini 2.5 Flash (백업)
-]
+        "gemini-3.5-flash-lite",      # 일일 500회 넉넉한 초고속 모델
+        "gemini-3.6-flash",           # 최신 플래시 백업
+        "gemini-flash-lite-latest"    # 공식 안정화 alias
+    ]
     max_attempts = len(GEMINI_API_KEYS) * len(active_models)
     last_error_msg = ""
 
@@ -149,11 +159,15 @@ def call_gemini_api(prompt: str) -> str:
                 res = requests.post(url, headers=headers, json=payload, timeout=25)
                 if res.status_code == 200:
                     data = res.json()
-                    raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    return convert_to_slack_markdown(raw_text)
+                    candidates = data.get("candidates", [])
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        if parts:
+                            raw_text = parts[0].get("text", "")
+                            return convert_to_slack_markdown(raw_text)
                 elif res.status_code == 429:
                     api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
-                    time.sleep(1)
+                    time.sleep(0.5)
                     break
                 else:
                     last_error_msg = f"{model} ({res.status_code})"
@@ -172,19 +186,21 @@ def extract_text_locally(file_bytes: bytes, file_name: str) -> str:
     text = ""
     try:
         if lower.endswith(".pdf"):
-            if PdfReader is None:
-                print("❌ pypdf 패키지가 설치되지 않았습니다. 설치를 진행해 주세요.")
-                return ""
-            reader = PdfReader(io.BytesIO(file_bytes))
-            for i, page in enumerate(reader.pages):
-                t = page.extract_text()
-                if t:
-                    text += f"\n[페이지 {i+1}]\n" + t.strip() + "\n"
+            if fitz:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                for page_num in range(len(doc)):
+                    t = doc[page_num].get_text()
+                    if t and t.strip():
+                        text += f"\n[{file_name} p.{page_num+1}]\n" + t.strip() + "\n"
+                doc.close()
+            elif PdfReader:
+                reader = PdfReader(io.BytesIO(file_bytes))
+                for i, page in enumerate(reader.pages):
+                    t = page.extract_text()
+                    if t and t.strip():
+                        text += f"\n[{file_name} p.{i+1}]\n" + t.strip() + "\n"
 
-        elif lower.endswith(".pptx"):
-            if Presentation is None:
-                print("❌ python-pptx 패키지가 설치되지 않았습니다. 설치를 진행해 주세요.")
-                return ""
+        elif lower.endswith(".pptx") and Presentation:
             prs = Presentation(io.BytesIO(file_bytes))
             for i, slide in enumerate(prs.slides):
                 slide_text = []
@@ -203,14 +219,10 @@ def extract_text_locally(file_bytes: bytes, file_name: str) -> str:
 def bg_process_drive_sync(payload: dict):
     file_name = payload.get("fileName", "")
     b64_contents = payload.get("fileBase64", "")
-    
     if not b64_contents:
         return
 
     file_bytes = base64.b64decode(b64_contents)
-    print(f"🚀 [로컬 파싱 시작] {file_name} ({len(file_bytes)} bytes)")
-
-    # Gemini API를 전혀 타지 않고 로컬에서 0.1초 만에 텍스트 추출
     extracted_text = extract_text_locally(file_bytes, file_name)
 
     if extracted_text and DAESEONG_QNA_WEBAPP_URL:
@@ -221,12 +233,9 @@ def bg_process_drive_sync(payload: dict):
             "source": f"드라이브문서({file_name})"
         }
         try:
-            res = requests.post(DAESEONG_QNA_WEBAPP_URL, json=save_payload, timeout=25)
-            print(f"✅ [마스터 시트 적재 완료] {file_name} ({len(extracted_text)}자) -> 상태: {res.status_code}")
+            requests.post(DAESEONG_QNA_WEBAPP_URL, json=save_payload, timeout=25)
         except Exception as e:
             print(f"❌ 마스터 시트 콜백 실패 ({file_name}): {e}")
-    else:
-        print(f"⚠️ [파싱 실패 또는 내용 없음] {file_name}")
 
 @app.post("/sync/drive-file")
 async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
@@ -241,7 +250,7 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
     if not slack_client or not thread_ts:
         return "", "", 1
     try:
-        res = slack_client.conversations_replies(channel=channel, ts=thread_ts, limit=20)
+        res = slack_client.conversations_replies(channel=channel, ts=thread_ts, limit=15)
         messages = res.get("messages", [])
         if not messages:
             return "", "", 1
@@ -258,32 +267,39 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
             history.append(f"{role}: {m.get('text', '')}")
 
         total_user_count = user_question_count + 1
-        return first_q, "\n".join(history), total_user_count
+        return first_q, "\n".join(history[-4:]), total_user_count
     except Exception as e:
         print(f"⚠️ 스레드 문맥 조회 예외: {e}")
         return "", "", 1
 
 def check_casual_intent(text: str) -> bool:
+    """
+    업무 관련 의문형 질문은 절대 일상대화로 빠지지 않도록 엄격 필터링
+    """
     clean = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
-    business_keywords = [
-        "본인확인", "확인해야", "확인방법", "연체", "해약", "환급", "양도", 
-        "명의", "프로세스", "절차", "서류", "발급", "신청", "인증", "기준", "어떻게"
+
+    # 1. 의문사나 물음형 키워드가 하나라도 있으면 무조건 업무 질의로 처리
+    inquiry_indicators = [
+        "?", "？", "있어", "있나요", "되나요", "인가요", "할까", "어때", "어떻게", 
+        "알려줘", "설명해", "기준", "제한", "연령", "나이", "금액", "환급", "해약", 
+        "양도", "명의", "비앤케어", "스카이펫", "상조", "서류", "조건", "얼마", "가능"
     ]
-    if any(b in clean for b in business_keywords):
+    if any(k in text.lower() for k in inquiry_indicators):
         return False
 
-    casual_keywords = [
-        "안녕", "하이", "헬로", "hello", "hi", "좋은아침", "굿모닝", "퇴근", "출근",
-        "고마워", "감사", "땡큐", "thanks", "수고", "고생", "화이팅", "파이팅", "힘내",
-        "대박", "최고", "짱", "짱이다", "굿잡", "든든",
-        "알겠", "오케이", "ok", "네", "넵", "넹", "응", "어", "ㅇㅇ", "굿", "굳", "좋아"
+    # 2. 순수 일상 인사 및 감탄 키워드만 제한적으로 허용
+    pure_casual = [
+        "안녕", "하이", "헬로", "좋은아침", "굿모닝", "퇴근", "출근",
+        "고마워", "감사", "땡큐", "수고", "고생", "화이팅", "파이팅",
+        "대박", "최고", "짱", "오케이", "네", "넵", "넹"
     ]
-    if len(clean) <= 15 and any(k in clean for k in casual_keywords):
+    if len(clean) <= 10 and any(k == clean or clean.startswith(k) for k in pure_casual):
         return True
+
     return False
 
 def check_manual_escalation_intent(text: str) -> bool:
-    keywords = ["팀장", "관리자", "sv", "에스브이", "상급자", "물어볼", "물어봐야", "물어볼래", "확인해볼", "올려볼", "질의서", "질문있어", "질문 있어"]
+    keywords = ["팀장", "관리자", "sv", "에스브이", "상급자", "질의서", "질문있어", "질문 있어"]
     return any(k in text.lower() for k in keywords)
 
 def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, sub_q: str, answer: str):
@@ -300,7 +316,7 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
             "answer": answer,
             "feedback": "",
             "review_status": "검수 필요"
-        }, timeout=5)
+        }, timeout=4)
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
@@ -369,8 +385,9 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
 
+    # 1. 일상 인사 필터링 (업무 질문은 통과)
     if check_casual_intent(clean_prompt):
-        casual_prompt = f"상담원의 인사나 반응에 다정하게 화답해 주세요. 상담원 말: '{clean_prompt}'"
+        casual_prompt = f"상담원의 일상 인사에 친절하고 다정하게 1~2문장으로 짧게 답해주세요. 상담원: '{clean_prompt}'"
         answer = call_gemini_api(casual_prompt)
         if slack_client:
             try:
@@ -390,21 +407,22 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         first_q_clean = clean_prompt
 
     wants_manual_escalate = check_manual_escalation_intent(clean_prompt)
-    is_escalation_triggered = (user_q_count >= 3) or wants_manual_escalate
 
     if wants_manual_escalate:
         answer = "관리자(SV)님께 바로 질문하실 수 있도록 접수를 도와드리겠습니다.\n아래 *[📋 관리자(SV) 질의 접수]* 버튼을 눌러 질의서를 작성해 주세요!"
+        is_escalation_triggered = True
     else:
         search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
-        knowledge = search_relevant_knowledge(search_target)
+        knowledge = search_relevant_knowledge(search_target, top_k=4)
 
         corrected_context = ""
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
+        # 💡 [핵심] 신뢰도 점수(Confidence Score) 기반 투-트랙 프롬프트
         system_instruction = f"""
-당신은 보람상조 양평센터 상담원들을 지원하는 사내 AI 어시스턴트입니다.
-사내 규정 지식과 관리자 보정 지침을 바탕으로 실무적이고 정확하게 답변하세요.
+당신은 보람상조 양평센터 상담원들을 지원하는 전문 사내 AI 어시스턴트입니다.
+제공된 사내 규정과 지침을 바탕으로 정확하고 완결된 답변을 작성하세요.
 
 {corrected_context}
 
@@ -417,38 +435,51 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [질문]:
 {clean_prompt}
 
-[원칙]:
-1. 관리자 보정 지침이 있으면 1순위로 적용하세요.
-2. 질문에 '본인확인'이 포함되면 본인확인 필수 항목(성함, 생년월일, 연락처 등)을 명시하세요.
-3. '절차', '순서', '방법' 질문은 1단계 -> 2단계 순서로 먼저 명확히 안내하세요.
+[답변 생성 원칙 - 엄격 준수]:
+1. **신뢰도 평가 (Confidence Score)**:
+   - 규정 지식에 명확한 근거(나이, 금액, 서류 등)가 확실히 있는 경우: 첫 줄에 `[신뢰도: 높음]` 표기
+   - 규정에 일부만 언급되어 유추가 필요한 경우: 첫 줄에 `[신뢰도: 보통]` 표기
+   - 규정에 아예 언급이 없거나, 사실과 다른 가정이 포함되었거나, 불확실한 경우: 첫 줄에 `[신뢰도: 낮음 (관리자 확인 필요)]` 표기
+2. **거짓 정보 생성 금지**: 규정에 없는 가입 연령 제한, 건강 상태 제한 등을 임의로 지어내지 마세요. 모르는 내용은 솔직히 "규정상 명시되지 않아 관리자 확인이 필요합니다"라고 안내하세요.
+3. **완결성 유지**: 문장 끝부분이 뚝 끊기지 않도록 모든 불릿 포인트와 문장을 마침표까지 완벽히 끝맺으세요. 불필요한 미사여구는 배제하고 실무 핵심만 작성하세요.
+4. 관리자 보정 지침이 있으면 최우선으로 적용하세요.
 """
-        base_answer = call_gemini_api(system_instruction)
-        answer = f"{base_answer}\n\n---\n*안내*: 세부 확인이 필요하시면 아래 버튼으로 관리자 질의를 접수하세요." if user_q_count >= 3 else base_answer
+        raw_answer = call_gemini_api(system_instruction)
+        
+        # 신뢰도 분석: 낮음이거나 규정 부재 시 관리자 접수 버튼 자동 활성화 (투-트랙)
+        is_low_confidence = "[신뢰도: 낮음" in raw_answer or "확인 필요" in raw_answer
+        is_escalation_triggered = (user_q_count >= 3) or is_low_confidence
 
+        if is_low_confidence:
+            answer = f"{raw_answer}\n\n---\n⚠️ *주의*: 사내 규정에 명확한 기준이 없거나 예외 사항일 수 있습니다. 아래 버튼을 눌러 관리자(SV)에게 정확한 내용을 확인받으세요."
+        elif user_q_count >= 3:
+            answer = f"{raw_answer}\n\n---\n*안내*: 추가 문의나 세부 확인이 필요하시면 아래 버튼으로 관리자 질의를 접수하세요."
+        else:
+            answer = raw_answer
+
+    # 슬랙 발송 처리
     if slack_client:
         try:
             slack_client.reactions_remove(channel=channel, timestamp=ts, name="eyes")
         except Exception:
             pass
 
+        # 텍스트가 2800자를 넘을 경우 블록 분할 전송 (슬랙 3,000자 제한 방어)
+        text_chunks = [answer[i:i+2800] for i in range(0, len(answer), 2800)]
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in text_chunks]
+
         if is_escalation_triggered:
-            blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": answer}},
-                {"type": "divider"},
-                {
-                    "type": "actions",
-                    "elements": [
-                        {"type": "button", "text": {"type": "plain_text", "text": "📋 관리자(SV) 질의 접수"}, "style": "primary", "action_id": "open_inquiry_modal_btn", "value": target_ts},
-                        {"type": "button", "text": {"type": "plain_text", "text": "❌ 작성 취소 (해결됨)"}, "action_id": "dismiss_inquiry_btn", "value": target_ts}
-                    ]
-                }
-            ]
-            post_kwargs = {"blocks": blocks}
-        else:
-            post_kwargs = {}
+            blocks.append({"type": "divider"})
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "📋 관리자(SV) 질의 접수"}, "style": "primary", "action_id": "open_inquiry_modal_btn", "value": target_ts},
+                    {"type": "button", "text": {"type": "plain_text", "text": "❌ 작성 취소 (해결됨)"}, "action_id": "dismiss_inquiry_btn", "value": target_ts}
+                ]
+            })
 
         try:
-            slack_client.chat_postMessage(channel=channel, thread_ts=target_ts, text=answer, **post_kwargs)
+            slack_client.chat_postMessage(channel=channel, thread_ts=target_ts, text=answer, blocks=blocks)
             slack_client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
         except Exception as e:
             print(f"❌ 슬랙 발송 실패: {e}")
