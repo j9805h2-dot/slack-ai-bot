@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, Response
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 
-# 텍스트 추출 라이브러리 (설치 완료 후 동작)
+# 로컬 텍스트 추출 라이브러리
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -161,95 +161,53 @@ def call_gemini_api(prompt: str) -> str:
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(원인: {last_error_msg[:100]})"
 
 # =========================================================================
-# 💡 [핵심] EC2 로컬 고속 텍스트 추출 엔진 (429 차단)
+# 💡 [핵심] 100% 로컬 텍스트 추출 (Gemini API 미호출 -> 429 원천 차단)
 # =========================================================================
 def extract_text_locally(file_bytes: bytes, file_name: str) -> str:
-    """PDF, PPTX 바이너리에서 토큰 소모 없이 순수 텍스트를 로컬 추출"""
     lower = file_name.lower()
     text = ""
     try:
-        if lower.endswith(".pdf") and PdfReader:
+        if lower.endswith(".pdf"):
+            if PdfReader is None:
+                print("❌ pypdf 패키지가 설치되지 않았습니다. 설치를 진행해 주세요.")
+                return ""
             reader = PdfReader(io.BytesIO(file_bytes))
-            for page in reader.pages:
+            for i, page in enumerate(reader.pages):
                 t = page.extract_text()
                 if t:
-                    text += t + "\n"
+                    text += f"\n[페이지 {i+1}]\n" + t.strip() + "\n"
 
-        elif lower.endswith(".pptx") and Presentation:
+        elif lower.endswith(".pptx"):
+            if Presentation is None:
+                print("❌ python-pptx 패키지가 설치되지 않았습니다. 설치를 진행해 주세요.")
+                return ""
             prs = Presentation(io.BytesIO(file_bytes))
-            for slide in prs.slides:
+            for i, slide in enumerate(prs.slides):
+                slide_text = []
                 for shape in slide.shapes:
                     if shape.has_text_frame:
                         for paragraph in shape.text_frame.paragraphs:
-                            if paragraph.text:
-                                text += paragraph.text + "\n"
+                            if paragraph.text.strip():
+                                slide_text.append(paragraph.text.strip())
+                if slide_text:
+                    text += f"\n[슬라이드 {i+1}]\n" + "\n".join(slide_text) + "\n"
     except Exception as e:
-        print(f"⚠️ 로컬 파일 텍스트 추출 중 경미한 오류 ({file_name}): {e}")
+        print(f"❌ 파일 파싱 예외 ({file_name}): {e}")
 
     return text.strip()
 
-def parse_and_refine_text(file_bytes: bytes, mime_type: str, file_name: str) -> str:
-    """로컬 텍스트 추출 후, 필요 시 경량 Gemini 요약 진행 (429 방어)"""
-    global api_key_index
-
-    # 1. 먼저 EC2 로컬에서 텍스트를 무료로 직접 추출
-    raw_text = extract_text_locally(file_bytes, file_name)
-
-    # 텍스트가 정상 추출된 경우: 그대로 쓰거나 용량이 너무 클 때만 슬라이싱
-    if raw_text and len(raw_text) > 30:
-        print(f"  ⚡ [로컬 텍스트 추출 성공] {file_name}: {len(raw_text)}글자 추출됨 (API 호출 불필요)")
-        return raw_text
-
-    # 2. 이미지 스캔형 PDF라 텍스트가 안 잡힐 때만 Gemini 비전 최소 호출
-    print(f"  🔍 [스캔 이미지 PDF 감지] Gemini 경량 파싱 진행: {file_name}")
-    if not GEMINI_API_KEYS:
-        return ""
-
-    b64_data = base64.b64encode(file_bytes).decode('utf-8')
-    prompt = f"이 문서('{file_name}')의 본문 규정과 주요 안내 내용을 실무자가 알 수 있도록 상세히 텍스트로 추출해 주세요."
-
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": b64_data}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3000}
-    }
-
-    candidate_models = ["gemini-flash-latest", "gemini-2.0-flash"]
-    for _ in range(len(GEMINI_API_KEYS)):
-        current_key = GEMINI_API_KEYS[api_key_index]
-        for model in candidate_models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}"
-            try:
-                res = requests.post(url, headers=headers, json=payload, timeout=40)
-                if res.status_code == 200:
-                    return res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                elif res.status_code == 429:
-                    api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
-                    time.sleep(2)
-                    break
-            except Exception:
-                pass
-        api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
-
-    return ""
-
 def bg_process_drive_sync(payload: dict):
     file_name = payload.get("fileName", "")
-    mime_type = payload.get("mimeType", "")
     b64_contents = payload.get("fileBase64", "")
     
     if not b64_contents:
         return
 
     file_bytes = base64.b64decode(b64_contents)
-    print(f"🚀 [EC2 파일 분석 시작] {file_name} ({len(file_bytes)} bytes)")
+    print(f"🚀 [로컬 파싱 시작] {file_name} ({len(file_bytes)} bytes)")
 
-    extracted_text = parse_and_refine_text(file_bytes, mime_type, file_name)
+    # Gemini API를 전혀 타지 않고 로컬에서 0.1초 만에 텍스트 추출
+    extracted_text = extract_text_locally(file_bytes, file_name)
 
     if extracted_text and DAESEONG_QNA_WEBAPP_URL:
         save_payload = {
@@ -259,12 +217,12 @@ def bg_process_drive_sync(payload: dict):
             "source": f"드라이브문서({file_name})"
         }
         try:
-            res = requests.post(DAESEONG_QNA_WEBAPP_URL, json=save_payload, timeout=20)
-            print(f"✅ [마스터 시트 적재 완료] {file_name} -> 시트 적재 상태: {res.status_code}")
+            res = requests.post(DAESEONG_QNA_WEBAPP_URL, json=save_payload, timeout=25)
+            print(f"✅ [마스터 시트 적재 완료] {file_name} ({len(extracted_text)}자) -> 상태: {res.status_code}")
         except Exception as e:
-            print(f"❌ 마스터 시트 콜백 실패: {e}")
+            print(f"❌ 마스터 시트 콜백 실패 ({file_name}): {e}")
     else:
-        print(f"⚠️ 텍스트 추출 내용 부족: {file_name}")
+        print(f"⚠️ [파싱 실패 또는 내용 없음] {file_name}")
 
 @app.post("/sync/drive-file")
 async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
@@ -273,7 +231,7 @@ async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
     return {"status": "accepted", "message": f"{data.get('fileName')} 작업 등록 완료"}
 
 # =========================================================================
-# 슬랙 이벤트 및 인터랙션 핸들러 유지
+# 슬랙 이벤트 & 인터랙션 처리 핸들러
 # =========================================================================
 def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
     if not slack_client or not thread_ts:
