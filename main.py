@@ -45,7 +45,7 @@ api_key_index = 0
 print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
-SHEET_CSV_URL = f"[https://docs.google.com/spreadsheets/d/](https://docs.google.com/spreadsheets/d/){MASTER_SHEET_ID}/export?format=csv"
+SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv"
 DAESEONG_QNA_WEBAPP_URL = os.environ.get("DAESEONG_WEBAPP_URL") or os.environ.get("LOG_WEBHOOK_URL", "")
 
 KNOWLEDGE_CACHE = []
@@ -125,23 +125,26 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     }
 
 def convert_to_slack_markdown(text: str) -> str:
-    """가독성 개선: 인용 태그 제거, 표준 마크다운 볼드(**)를 슬랙 볼드(*)로 변환, 불필요한 줄바꿈 정리"""
-    # 1. AI 인용 태그 제거
+    """가독성 개선: 인용 태그 제거 및 슬랙 전용 마크다운(*볼드*, >인용구, `코드`) 확실한 변환"""
+    if not text:
+        return ""
+
+    # 1. 인용 태그 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
     
-    # 2. 마크다운 볼드(**텍스트**)를 슬랙 볼드(*텍스트*)로 변환
-    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    # 2. 마크다운 볼드(**텍스트**) -> 슬랙 볼드(*텍스트*)로 강제 치환
+    text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text, flags=re.DOTALL)
 
-    # 3. 마크다운 헤더(###, ####) 기호 슬랙 볼드 처리
+    # 3. 마크다운 헤더(###, ####) 기호 정리
     text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)
 
-    # 4. 불필요한 수평선(---, ***) 제거
+    # 4. 불필요한 마크다운 수평선(---, ***) 제거
     text = re.sub(r'^[ \t]*[-*_]{3,}[ \t]*$', '', text, flags=re.MULTILINE)
 
     # 5. 외톨이 특수문자 단독 줄 제거
     text = re.sub(r'^[ \t]*[•\*\-]{1,2}[ \t]*$', '', text, flags=re.MULTILINE)
 
-    # 6. 연속된 3개 이상의 개행을 2개로 압축 (단락 간 자연스러운 1줄 공백 유지)
+    # 6. 연속된 3개 이상의 빈 줄을 2개로 압축
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -171,7 +174,8 @@ def call_gemini_api(prompt: str) -> str:
     for _ in range(max_attempts):
         current_key = GEMINI_API_KEYS[api_key_index]
         for model in active_models:
-            url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model}:generateContent?key={current_key}"
+            # 💡 [정상화] 깨진 마크다운 링크 기호 없이 순수 URL 지정
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}"
             try:
                 res = requests.post(url, headers=headers, json=payload, timeout=25)
                 if res.status_code == 200:
@@ -424,10 +428,12 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
-        # 💡 [핵심] 볼드, 인용구(>), 인라인 코드(`)를 적극 활용하도록 구성한 슬랙 고가독성 프롬프트
+        # 💡 [핵심] 슬랙 전용 마크다운 서식 템플릿 강제화
         system_instruction = f"""
-당신은 보람상조 양평센터 상담원들을 지원하는 꼼꼼하고 다정한 사내 전문 AI 어시스턴트입니다.
-상담원이 고객 통화 중 즉시 안내할 수 있도록 가독성이 뛰어난 슬랙 서식(볼드, 인용구, 인라인 코드)을 활용하여 핵심을 명확히 전달하세요.
+당신은 보람상조 양평센터 상담원들을 지원하는 전문 사내 AI 어시스턴트입니다.
+상담원이 슬랙 화면에서 한눈에 정보를 파악할 수 있도록 **슬랙 전용 마크다운 서식(인용구 `>`, 볼드 `*`, 인라인 코드 `` ` ``)**을 철저히 지켜 답변하세요.
+
+⚠️ 중요: 슬랙에서는 `**`를 사용하면 굵은 글씨가 되지 않습니다. 볼드는 반드시 별 1개(`*텍스트*`)로 표기하세요.
 
 {corrected_context}
 
@@ -440,30 +446,15 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [질문]:
 {clean_prompt}
 
-[답변 작성 및 가독성 서식 규칙 - 엄격 준수]:
-1. **첫 줄 신뢰도 표기**:
-   - 사내 규정에 명확한 근거가 있는 경우: `[신뢰도: 높음 🟢]`
-   - 규정 중 일부 유추/복합 확인이 필요한 경우: `[신뢰도: 보통 🟡]`
-   - 규정에 내용이 없거나 사실 확인이 필요한 경우: `[신뢰도: 낮음 (관리자 확인 필요) 🔴]`
-   (신뢰도 바로 다음 줄에는 빈 줄 1개를 띄우세요.)
+[답변 작성 서식 규격 - 아래 구조를 반드시 엄수하여 출력]:
+[신뢰도: 높음 🟢] (또는 보통 🟡 / 낮음 🔴)
 
-2. **핵심 결론 (두괄식 안내 - 인용구 및 볼드 활용)**:
-   - 질문에 대한 핵심 결론은 **반드시 인용구(`>`) 기호**로 시작하고, 중요 결론 부분은 `*볼드체*`로 강조하세요.
-   - 예시: `> *핵심 결론:* 본 상품은 만 19세부터 가입 가능하며, 최대 2구좌까지 신청할 수 있습니다. ✨`
-   - 불필요한 서론("질문 감사합니다", "상담원님" 등)이나 인용 태그(cite 등)는 쓰지 마세요.
+> *핵심 요약:* (질문에 대한 명쾌한 1~2줄 결론을 인용구 `>` 기호로 시작하고 `*볼드*`로 강조)
 
-3. **상세 규정 및 실무 체크포인트 (불릿 & 인라인 코드 활용)**:
-   - 각 세부 항목 앞에는 깔끔한 불릿(`•`)을 붙이고, 항목명은 `*항목명:*` 형태로 볼드 처리하세요.
-   - 계약명, 서류명, 전산 메뉴, URL, 구좌 수 등 중요 키워드는 `` `인라인 코드` ``로 감싸 한눈에 띄게 하세요.
-     (예시: `• *구비 서류:* 본인 확인을 위해 `신분증 사본` 및 `가족관계증명서`가 필요합니다.`)
-   - 단락과 불릿 사이에는 자연스럽게 1줄 공백만 유지하고, 불필요한 빈 줄을 남발하지 마세요.
-   - 수평선(`---`)은 일체 사용하지 마세요.
+• *세부 항목명:* 세부 규정 설명 (`주요 단어/서류/수치/URL`은 인라인 코드 `` ` ``로 감싸기)
+• *세부 항목명:* 세부 규정 설명 (`주요 단어/서류/수치/URL`은 인라인 코드 `` ` ``로 감싸기)
 
-4. **실무 상담 팁 / 주의사항 (💡)**:
-   - 고객 응대 시 주의점이나 전산 팁은 하단에 인용구(`> 💡 *실무 팁:* ...`) 형태로 1~2줄 덧붙여 실무 활용도를 높이세요.
-
-5. **거짓 정보 금지**:
-   - 지식에 명시되지 않은 내용은 추측하지 말고 솔직하게 "해당 사항은 사내 규정에 명시되어 있지 않아 SV 확인을 권장드립니다"라고 안내하세요.
+> 💡 *실무 상담 팁:* (고객 응대 시 주의점이나 전산 팁을 인용구 `>` 기호로 작성)
 """
         raw_answer = call_gemini_api(system_instruction)
         
