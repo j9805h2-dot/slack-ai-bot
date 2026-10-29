@@ -125,13 +125,22 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     }
 
 def convert_to_slack_markdown(text: str) -> str:
-    """가독성 개선: 지저분한 인용 태그 제거 및 뭉쳐진 항목 강제 줄바꿈"""
+    """가독성 개선: 인용 태그 제거, 쪼개진 외톨이 마크다운 기호 및 과도한 빈 줄 정리"""
+    # 1. 인용 태그 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
+    
+    # 2. 마크다운 헤더(###, ####) 기호 볼드 처리
     text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)
-    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
-    text = re.sub(r'([^\n])\s*([•\*\-]\s+)', r'\1\n\n\2', text)
-    text = re.sub(r'([^\n])\s*(\d+\.\s+)', r'\1\n\n\2', text)
+
+    # 3. 불필요한 마크다운 수평선(---, ***) 제거 (줄바꿈 테러 방지)
+    text = re.sub(r'^[ \t]*[-*_]{3,}[ \t]*$', '', text, flags=re.MULTILINE)
+
+    # 4. 외톨이로 홀로 떨어진 특수문자(-, *, • 등) 단독 줄 제거
+    text = re.sub(r'^[ \t]*[•\*\-]{1,2}[ \t]*$', '', text, flags=re.MULTILINE)
+
+    # 5. 연속된 3개 이상의 빈 줄을 최대 1개의 빈 줄(개행 2개)로 압축
     text = re.sub(r'\n{3,}', '\n\n', text)
+
     return text.strip()
 
 def call_gemini_api(prompt: str) -> str:
@@ -313,7 +322,6 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 💡 [핵심] 버튼이 포함된 메시지 타임스탬프(message_ts)를 인자로 받아 private_metadata에 저장
 def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_id: str, message_ts: str = "") -> dict:
     return {
         "type": "modal",
@@ -413,6 +421,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
+        # 💡 [개선] 과도한 2단 줄바꿈 강제 제거 및 자연스러운 단락 정돈 프롬프트
         system_instruction = f"""
 당신은 보람상조 양평센터 상담원들을 지원하는 꼼꼼하고 다정한 사내 전문 AI 어시스턴트입니다.
 상담원이 고객 통화 중 즉시 안내할 수 있도록 **핵심 결론을 먼저 제시하고, 연관된 세부 규정(가입 요건, 구비서류, 유의사항, 예외조건 등)을 충분하고 구체적으로 설명**하세요.
@@ -433,19 +442,19 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
    - 사내 규정에 명확한 근거가 있는 경우: `[신뢰도: 높음 🟢]`
    - 규정 중 일부 유추/복합 확인이 필요한 경우: `[신뢰도: 보통 🟡]`
    - 규정에 내용이 없거나 사실 확인이 필요한 경우: `[신뢰도: 낮음 (관리자 확인 필요) 🔴]`
-   (신뢰도 표기 직후 반드시 엔터를 2번 쳐서 아래 내용과 띄우세요.)
 
 2. **핵심 결론 (두괄식 안내)**:
-   - 질문에 대한 핵심 결론을 첫 문장에 1~2줄로 명쾌하고 친절하게 제시하세요.
-   - 불필요한 서론("질문 주셔서 감사합니다" 등)이나 인용 태그(cite 등)는 쓰지 마세요.
+   - 질문에 대한 핵심 결론을 첫머리에 1~2줄로 명쾌하고 친절하게 제시하세요.
+   - 서론("질문 주셔서 감사합니다" 등)이나 인용 태그(cite 등)는 일체 쓰지 마세요.
 
-3. **상세 규정 및 실무 체크포인트 (충분한 설명 제공)**:
-   - 너무 지나치게 축약하지 말고, 상담원이 꼭 알아야 할 세부 항목(가입 기준, 구좌 수, 서류, 예외 조건 등)을 구체적인 불릿(•)으로 나누어 상세히 설명하세요.
-   - 각 불릿 항목 사이에는 **반드시 줄바꿈을 2번(\n\n)** 넣어 슬랙에서 줄글이 뭉치지 않게 하세요.
+3. **상세 규정 및 실무 체크포인트**:
+   - 너무 축약하지 말고 상담원이 꼭 알아야 할 세부 항목(가입 기준, 구좌 수, 서류, 예외 조건 등)을 간결한 불릿(•)으로 정리하세요.
+   - 단락과 불릿 사이에는 자연스러운 공백(한 줄 띄움)만 유지하고, 불필요하게 빈 줄을 연달아 남발하지 마세요.
+   - 불필요한 마크다운 구분선(--- 등)은 절대 사용하지 마세요.
    - 말투는 전문적이면서도 따뜻한 톤("~해 주셔야 해요 😊", "~가능합니다 ✨")을 유지하세요.
 
 4. **실무 상담 팁 / 주의사항 (💡)**:
-   - 고객 응대 시 유용한 멘트나 전산 등록 시 주의해야 할 사항을 하단에 1~2줄 덧붙여 실무 활용도를 높이세요.
+   - 고객 응대 시 유용한 멘트나 전산 주의사항을 하단에 간결하게 덧붙이세요.
 
 5. **거짓 정보 금지**:
    - 지식에 명시되지 않은 내용은 추측하지 말고 솔직하게 "해당 사항은 규정에 명시되어 있지 않아 SV 확인을 권장드립니다"라고 안내하세요.
@@ -456,9 +465,9 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         is_escalation_triggered = (user_q_count >= 3) or is_low_confidence
 
         if is_low_confidence:
-            answer = f"{raw_answer}\n\n---\n⚠️ *주의*: 사내 규정에 명확한 기준이 없거나 예외 사항일 수 있습니다. 아래 버튼을 눌러 관리자(SV)에게 정확한 내용을 확인받으세요."
+            answer = f"{raw_answer}\n\n⚠️ *주의*: 사내 규정에 명확한 기준이 없거나 예외 사항일 수 있습니다. 아래 버튼을 눌러 관리자(SV)에게 정확한 내용을 확인받으세요."
         elif user_q_count >= 3:
-            answer = f"{raw_answer}\n\n---\n*안내*: 추가 문의나 세부 확인이 필요하시면 아래 버튼으로 관리자 질의를 접수하세요."
+            answer = f"{raw_answer}\n\n*안내*: 추가 문의나 세부 확인이 필요하시면 아래 버튼으로 관리자 질의를 접수하세요."
         else:
             answer = raw_answer
 
@@ -522,7 +531,6 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 💡 [핵심] 버튼이 포함된 봇의 메시지 ts(btn_msg_ts)를 정확히 타겟팅하여 수정
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -549,7 +557,6 @@ def bg_process_submission(view: dict):
     btn_msg_ts = meta.get("message_ts")
     
     if slack_client and channel_id:
-        # 버튼이 있던 봇 메시지의 버튼 블록 제거
         if btn_msg_ts:
             try:
                 res = slack_client.conversations_replies(channel=channel_id, ts=btn_msg_ts, limit=1)
@@ -565,7 +572,6 @@ def bg_process_submission(view: dict):
             except Exception as e:
                 print(f"⚠️ 질의 버튼 제거 실패: {e}")
 
-        # 안내 문구 전송
         if thread_ts:
             try:
                 slack_client.chat_postMessage(
@@ -594,7 +600,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 if action_id == "open_inquiry_modal_btn":
                     trigger_id = payload.get("trigger_id")
                     channel_id = payload.get("channel", {}).get("id")
-                    message_ts = payload.get("message", {}).get("ts", "")  # 💡 버튼이 달린 메시지 ts 추출
+                    message_ts = payload.get("message", {}).get("ts", "")
                     user_info = payload.get("user", {})
                     user_id = user_info.get("id")
                     user_name = user_info.get("name", "상담사")
