@@ -132,7 +132,7 @@ def convert_to_slack_markdown(text: str) -> str:
     # 1. 인용 태그 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
 
-    # 2. 💡 [핵심] 가독성을 해치는 백틱/인라인 코드블록(`) 전부 제거
+    # 2. 가독성을 해치는 백틱/인라인 코드블록(`) 제거
     text = text.replace('`', '')
     
     # 3. 일반 마크다운 볼드(**텍스트**) -> 슬랙 볼드(*텍스트*) 변환
@@ -395,7 +395,8 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception:
             pass
 
-    clean_prompt = re.sub(r'^[질의-AI]\s*', '', user_text).strip()
+    # 💡 [핵심 수정] [질의] 접두사 정밀 제거 (기존 [질의-AI]도 호환되도록 안전 처리)
+    clean_prompt = re.sub(r'^(?:\[질의\]|\[질의-AI\])\s*', '', user_text).strip()
 
     if check_casual_intent(clean_prompt):
         casual_prompt = f"상담원의 일상 인사에 친절하고 다정하게 1~2문장으로 짧게 답해주세요. 상담원: '{clean_prompt}'"
@@ -413,7 +414,8 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     first_q_text, thread_history, user_q_count = ("", "", 1)
     if is_thread_reply:
         first_q_text, thread_history, user_q_count = get_thread_context_and_count(channel, thread_ts)
-        first_q_clean = re.sub(r'^[질의-AI]\s*', '', first_q_text).strip()
+        # 💡 [핵심 수정] 스레드 첫 질문 접두사 안전 제거
+        first_q_clean = re.sub(r'^(?:\[질의\]|\[질의-AI\])\s*', '', first_q_text).strip()
     else:
         first_q_clean = clean_prompt
 
@@ -430,7 +432,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
-        # 💡 [핵심] 코드블록/백틱(`) 절대 금지, 인용구(>)와 슬랙 볼드(*)로만 깔끔하게 정돈
         system_instruction = f"""
 당신은 보람상조 양평센터 상담원들을 지원하는 전문 사내 AI 어시스턴트입니다.
 상담원이 슬랙 화면에서 깔끔하고 편안하게 읽을 수 있도록 정돈된 슬랙 서식으로 답변하세요.
@@ -527,7 +528,9 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     bot_id = event.get("bot_id")
     user_id = event.get("user", "상담원")
 
-    if not bot_id and (text.startswith("[질의-AI]") or (thread_ts and thread_ts != ts)):
+    # 💡 [핵심 수정] [질의] 또는 기존 [질의-AI]로 시작하거나, 스레드 대댓글인 경우 실행
+    is_qna_trigger = text.startswith("[질의]") or text.startswith("[질의-AI]")
+    if not bot_id and (is_qna_trigger or (thread_ts and thread_ts != ts)):
         background_tasks.add_task(process_slack_question, channel, ts, thread_ts, text, user_id)
 
     return {"status": "ok"}
