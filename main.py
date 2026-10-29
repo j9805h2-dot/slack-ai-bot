@@ -82,6 +82,7 @@ def normalize_text(text: str) -> str:
 
 def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
+    # 관리자가 시트에서 보정한 내용을 빠르게 반영하기 위해 60초마다 동기화
     if time.time() - LAST_SYNC_TIME > 60:
         refresh_all_knowledge()
 
@@ -179,13 +180,9 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
 def check_casual_intent(text: str) -> bool:
     clean = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
     casual_keywords = [
-        # 인사 및 안부
         "안녕", "하이", "헬로", "hello", "hi", "좋은아침", "굿모닝", "퇴근", "출근",
-        # 감사 및 격려
         "고마워", "감사", "땡큐", "thanks", "수고", "고생", "화이팅", "파이팅", "힘내",
-        # 칭찬 및 감탄
         "대박", "최고", "짱", "짱이다", "굿잡", "든든",
-        # 단순 확인 및 긍정 리액션
         "알겠", "오케이", "ok", "확인", "네", "넵", "넹", "응", "어", "ㅇㅇ", "굿", "굳", "좋아"
     ]
     if len(clean) <= 20 and any(k in clean for k in casual_keywords):
@@ -198,7 +195,7 @@ def check_manual_escalation_intent(text: str) -> bool:
     normalized = text.lower()
     return any(k in normalized for k in keywords)
 
-# 8. 질의로그 시트 전송
+# 8. 질의로그 시트 전송 (초기 검수 상태를 '검수 필요'로 전송하여 드롭다운 선택 가능하게 처리)
 def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, sub_q: str, answer: str):
     if not LOG_WEBHOOK_URL:
         return
@@ -210,7 +207,9 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
             "user_id": user_id,
             "first_question": first_q,
             "sub_question": sub_q,
-            "answer": answer
+            "answer": answer,
+            "feedback": "",
+            "review_status": "검수 필요"  # '올바른 답변' 대신 초기 상태는 '검수 필요'로 지정
         }, timeout=5)
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
@@ -308,7 +307,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
 
-    # 1) 일상 대화/인사/감사 감지 시 -> 버튼 없는 다정한 단독 격려 응답 (횟수 누적 차단)
+    # 1) 일상 대화/인사/감사 감지 시 -> 버튼 없는 다정한 단독 격려 응답 (질문 횟수 누적 차단)
     if check_casual_intent(clean_prompt):
         casual_prompt = f"""
 당신은 보람상조 양평센터 상담원들을 항상 곁에서 응원하고 돕는 친절하고 다정한 사내 AI 동료 '대성봇'입니다.
@@ -360,6 +359,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
         knowledge = search_relevant_knowledge(search_target)
 
+        # ⚠️ 관리자 보정 지식/피드백을 프롬프트 최상단에 1순위로 배치
         corrected_context = ""
         if knowledge.get('corrected_rules'):
             corrected_context = f"""
@@ -383,7 +383,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 {clean_prompt}
 
 [답변 작성 원칙]:
-1. [⚠️ 관리자 최우선 보정 지침]에 기재된 피드백이나 보정 내용이 있다면 기존 규정보다 무조건 1순위로 채택하여 답변하세요.
+1. [⚠️ 관리자 최우선 보정 지침]에 기재된 피드백이나 보정 내용이 있다면 기존 마스터 규정보다 무조건 1순위로 채택하여 답변하세요.
 2. 질문에 '프로세스', '절차', '순서', '방법', '단계' 등의 키워드가 포함된 경우:
    - 반드시 **실무자가 취해야 할 단계별 진행 순서(1단계 ➔ 2단계 ➔ 3단계...)**를 최우선으로 명확히 제시하세요.
    - 혜택 중단/복구, 약관 조항, 환급금 주의사항 등은 단계별 프로세스 하단에 **[참고 및 고객 안내 사항]** 형태로 구분하여 보조 정보로 제공하세요.
@@ -492,7 +492,6 @@ def bg_process_submission(view: dict):
     thread_ts = meta.get("thread_ts")
     user_id = meta.get("user_id", "")
 
-    # 앱스크립트 수정 없이 슬랙 멘션을 쏠 수 있도록 <@USER_ID> 형태로 전달
     author_val = f"<@{user_id}>" if user_id else author_text
 
     sheet_payload = {
@@ -568,7 +567,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
 
                     return Response(status_code=200)
 
-                # [작성 취소 버튼 - 버튼 삭제 및 종료 댓글]
+                # [작성 취소 버튼 - 원본 메시지 버튼 삭제 및 종료 알림 댓글]
                 elif action_id == "dismiss_inquiry_btn":
                     channel_id = payload.get("channel", {}).get("id")
                     user_id = payload.get("user", {}).get("id")
@@ -578,7 +577,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                     original_text = message_info.get("text", "")
 
                     if slack_client and channel_id:
-                        # 1단계: 기존 메시지에서 버튼 블록(blocks) 제거
+                        # 기존 메시지에서 버튼 블록(blocks) 제거
                         if message_ts:
                             try:
                                 slack_client.chat_update(
@@ -592,7 +591,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                             except Exception as e:
                                 print(f"⚠️ 버튼 제거(chat.update) 실패: {e}")
 
-                        # 2단계: 스레드에 취소/종료 알림 댓글 발송
+                        # 스레드에 종료 알림 댓글 발송
                         try:
                             slack_client.chat_postMessage(
                                 channel=channel_id,
