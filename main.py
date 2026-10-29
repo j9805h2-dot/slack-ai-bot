@@ -82,7 +82,6 @@ def normalize_text(text: str) -> str:
 
 def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
-    # 관리자가 시트에서 보정한 내용을 빠르게 반영하기 위해 60초마다 동기화
     if time.time() - LAST_SYNC_TIME > 60:
         refresh_all_knowledge()
 
@@ -110,7 +109,7 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
         "master_rules": score_items(KNOWLEDGE_CACHE)
     }
 
-# 4. 볼드체 변환 유틸 (Gemini **text** -> Slack *text*)
+# 4. 볼드체 변환 유틸
 def convert_to_slack_markdown(text: str) -> str:
     return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
 
@@ -176,16 +175,25 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
         print(f"⚠️ 스레드 문맥 조회 예외: {e}")
         return "", "", 1
 
-# 7-1. 일상 인사, 안부, 감사, 단순 리액션 표현 감지 유틸
+# 7-1. 일상 대화 판별 (업무 키워드 포함 시 무조건 제외)
 def check_casual_intent(text: str) -> bool:
     clean = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
+    
+    # 🚨 업무 및 규정 질문 키워드는 절대 일상 대화로 오인하지 않음
+    business_keywords = [
+        "본인확인", "확인해야", "확인방법", "연체", "해약", "환급", "양도", 
+        "명의", "프로세스", "절차", "서류", "발급", "신청", "인증", "기준", "어떻게"
+    ]
+    if any(b in clean for b in business_keywords):
+        return False
+
     casual_keywords = [
         "안녕", "하이", "헬로", "hello", "hi", "좋은아침", "굿모닝", "퇴근", "출근",
         "고마워", "감사", "땡큐", "thanks", "수고", "고생", "화이팅", "파이팅", "힘내",
         "대박", "최고", "짱", "짱이다", "굿잡", "든든",
-        "알겠", "오케이", "ok", "확인", "네", "넵", "넹", "응", "어", "ㅇㅇ", "굿", "굳", "좋아"
+        "알겠", "오케이", "ok", "네", "넵", "넹", "응", "어", "ㅇㅇ", "굿", "굳", "좋아"
     ]
-    if len(clean) <= 20 and any(k in clean for k in casual_keywords):
+    if len(clean) <= 15 and any(k in clean for k in casual_keywords):
         return True
     return False
 
@@ -195,7 +203,7 @@ def check_manual_escalation_intent(text: str) -> bool:
     normalized = text.lower()
     return any(k in normalized for k in keywords)
 
-# 8. 질의로그 시트 전송 (초기 검수 상태를 '검수 필요'로 전송하여 드롭다운 선택 가능하게 처리)
+# 8. 질의로그 시트 전송
 def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, sub_q: str, answer: str):
     if not LOG_WEBHOOK_URL:
         return
@@ -209,12 +217,12 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
             "sub_question": sub_q,
             "answer": answer,
             "feedback": "",
-            "review_status": "검수 필요"  # '올바른 답변' 대신 초기 상태는 '검수 필요'로 지정
+            "review_status": "검수 필요"
         }, timeout=5)
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 9. 모달 UI 생성 함수 (user_id 메타데이터 보존)
+# 9. 모달 UI 생성 함수
 def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_id: str) -> dict:
     return {
         "type": "modal",
@@ -307,7 +315,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
 
-    # 1) 일상 대화/인사/감사 감지 시 -> 버튼 없는 다정한 단독 격려 응답 (질문 횟수 누적 차단)
+    # 1) 일상 대화/인사/감사 감지 시 -> 단독 격려 응답 (버튼 미부착)
     if check_casual_intent(clean_prompt):
         casual_prompt = f"""
 당신은 보람상조 양평센터 상담원들을 항상 곁에서 응원하고 돕는 친절하고 다정한 사내 AI 동료 '대성봇'입니다.
@@ -318,7 +326,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 - 감사를 표하면 뿌듯한 마음과 함께 언제든 돕겠다는 다정한 멘트를 건네세요.
 - 업무 마감이나 퇴근, 수고 인사를 하면 따뜻한 위로와 응원을 전하세요.
 - 이모지(😊, ✨, 👍, 🍀 등)를 적절히 섞어 1~2줄 내외로 간결하고 기분 좋게 답변하세요.
-- 불필요한 사과나 시스템적인 문구(예: '버튼을 누르세요', '규정 확인' 등)는 절대 넣지 마세요.
+- 불필요한 사과나 시스템적인 문구는 절대 넣지 마세요.
 
 상담원의 말: "{clean_prompt}"
 """
@@ -359,7 +367,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
         knowledge = search_relevant_knowledge(search_target)
 
-        # ⚠️ 관리자 보정 지식/피드백을 프롬프트 최상단에 1순위로 배치
         corrected_context = ""
         if knowledge.get('corrected_rules'):
             corrected_context = f"""
@@ -369,7 +376,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
         system_instruction = f"""
 당신은 보람상조 양평센터 상담원들을 지원하는 사내 AI 어시스턴트입니다.
-사내 규정 지식과 관리자 보정 지침을 바탕으로 실무적이고 명확하게 답변하세요.
+사내 규정 지식과 관리자 보정 지침을 바탕으로 실무적이고 정확하게 답변하세요.
 
 {corrected_context}
 
@@ -383,11 +390,13 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 {clean_prompt}
 
 [답변 작성 원칙]:
-1. [⚠️ 관리자 최우선 보정 지침]에 기재된 피드백이나 보정 내용이 있다면 기존 마스터 규정보다 무조건 1순위로 채택하여 답변하세요.
-2. 질문에 '프로세스', '절차', '순서', '방법', '단계' 등의 키워드가 포함된 경우:
-   - 반드시 **실무자가 취해야 할 단계별 진행 순서(1단계 ➔ 2단계 ➔ 3단계...)**를 최우선으로 명확히 제시하세요.
+1. [⚠️ 관리자 최우선 보정 지침]에 기재된 피드백이나 보정 내용이 있다면 기존 규정보다 무조건 1순위로 채택하여 답변하세요.
+2. 질문에 '본인확인' 키워드가 있거나 관련 문의인 경우:
+   - 반드시 **사내 본인확인 프로세스 기준(성함, 생년월일, 연락처, 회원번호 등 필수 확인 항목 및 대리인 인입 시 위임 기준)**을 단계별로 엄격하게 설명하세요.
+3. 질문에 '프로세스', '절차', '순서', '방법', '단계' 등의 키워드가 포함된 경우:
+   - 반드시 **실무자가 취해야 할 단계별 진행 순서(1단계 ➔ 2단계 ➔ 3단계...)**를 최우선으로 먼저 명확히 제시하세요.
    - 혜택 중단/복구, 약관 조항, 환급금 주의사항 등은 단계별 프로세스 하단에 **[참고 및 고객 안내 사항]** 형태로 구분하여 보조 정보로 제공하세요.
-3. 상담사가 고객과 통화 중 바로 참고할 수 있도록 불릿 포인트와 볼드체를 활용해 핵심만 간결하게 작성하세요.
+4. 상담사가 고객과 통화 중 바로 참고할 수 있도록 불릿 포인트와 볼드체를 활용해 핵심만 간결하게 작성하세요.
 """
         base_answer = call_gemini_api(system_instruction)
 
@@ -476,7 +485,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 모달 제출 후 시트 전송 처리 (E열 작성자에 멘션 태그 포맷 적용)
+# 12. 모달 제출 후 시트 전송 처리
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -538,7 +547,6 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 action_id = action.get("action_id")
                 raw_val = action.get("value", "")
 
-                # [모달 열기 버튼]
                 if action_id == "open_inquiry_modal_btn":
                     trigger_id = payload.get("trigger_id")
                     channel_id = payload.get("channel", {}).get("id")
@@ -567,7 +575,6 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
 
                     return Response(status_code=200)
 
-                # [작성 취소 버튼 - 원본 메시지 버튼 삭제 및 종료 알림 댓글]
                 elif action_id == "dismiss_inquiry_btn":
                     channel_id = payload.get("channel", {}).get("id")
                     user_id = payload.get("user", {}).get("id")
@@ -577,7 +584,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                     original_text = message_info.get("text", "")
 
                     if slack_client and channel_id:
-                        # 기존 메시지에서 버튼 블록(blocks) 제거
+                        # 1단계: 기존 메시지에서 버튼 블록(blocks) 제거
                         if message_ts:
                             try:
                                 slack_client.chat_update(
@@ -589,9 +596,9 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                                     ]
                                 )
                             except Exception as e:
-                                print(f"⚠️ 버튼 제거(chat.update) 실패: {e}")
+                                print(f"⚠️ 버튼 제거 실패: {e}")
 
-                        # 스레드에 종료 알림 댓글 발송
+                        # 2단계: 종료 알림 댓글 발송
                         try:
                             slack_client.chat_postMessage(
                                 channel=channel_id,
