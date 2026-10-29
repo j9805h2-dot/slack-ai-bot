@@ -125,26 +125,29 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     }
 
 def convert_to_slack_markdown(text: str) -> str:
-    """가독성 개선: 인용 태그 제거 및 슬랙 전용 마크다운(*볼드*, >인용구, `코드`) 확실한 변환"""
+    """가독성 개선: 인용 태그 제거, 빽빽한 백틱(`) 코드블록 제거, 슬랙 볼드(*) 변환 및 줄바꿈 정돈"""
     if not text:
         return ""
 
     # 1. 인용 태그 제거
     text = re.sub(r'\[cite:[^\]]+\]', '', text)
+
+    # 2. 💡 [핵심] 가독성을 해치는 백틱/인라인 코드블록(`) 전부 제거
+    text = text.replace('`', '')
     
-    # 2. 마크다운 볼드(**텍스트**) -> 슬랙 볼드(*텍스트*)로 강제 치환
+    # 3. 일반 마크다운 볼드(**텍스트**) -> 슬랙 볼드(*텍스트*) 변환
     text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text, flags=re.DOTALL)
 
-    # 3. 마크다운 헤더(###, ####) 기호 정리
+    # 4. 마크다운 헤더(###, ####) 기호 볼드 처리
     text = re.sub(r'#{1,6}\s*(.+)', r'*\1*', text)
 
-    # 4. 불필요한 마크다운 수평선(---, ***) 제거
+    # 5. 불필요한 마크다운 수평선(---, ***) 제거
     text = re.sub(r'^[ \t]*[-*_]{3,}[ \t]*$', '', text, flags=re.MULTILINE)
 
-    # 5. 외톨이 특수문자 단독 줄 제거
+    # 6. 외톨이 특수문자 단독 줄 제거
     text = re.sub(r'^[ \t]*[•\*\-]{1,2}[ \t]*$', '', text, flags=re.MULTILINE)
 
-    # 6. 연속된 3개 이상의 빈 줄을 2개로 압축
+    # 7. 연속된 3개 이상의 개행을 2개로 압축 (단락 간 1줄 공백 유지)
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -174,7 +177,6 @@ def call_gemini_api(prompt: str) -> str:
     for _ in range(max_attempts):
         current_key = GEMINI_API_KEYS[api_key_index]
         for model in active_models:
-            # 💡 [정상화] 깨진 마크다운 링크 기호 없이 순수 URL 지정
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}"
             try:
                 res = requests.post(url, headers=headers, json=payload, timeout=25)
@@ -393,7 +395,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         except Exception:
             pass
 
-    clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
+    clean_prompt = re.sub(r'^[질의-AI]\s*', '', user_text).strip()
 
     if check_casual_intent(clean_prompt):
         casual_prompt = f"상담원의 일상 인사에 친절하고 다정하게 1~2문장으로 짧게 답해주세요. 상담원: '{clean_prompt}'"
@@ -411,7 +413,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     first_q_text, thread_history, user_q_count = ("", "", 1)
     if is_thread_reply:
         first_q_text, thread_history, user_q_count = get_thread_context_and_count(channel, thread_ts)
-        first_q_clean = re.sub(r'^\[질의-AI\]\s*', '', first_q_text).strip()
+        first_q_clean = re.sub(r'^[질의-AI]\s*', '', first_q_text).strip()
     else:
         first_q_clean = clean_prompt
 
@@ -428,12 +430,14 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         if knowledge.get('corrected_rules'):
             corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
-        # 💡 [핵심] 슬랙 전용 마크다운 서식 템플릿 강제화
+        # 💡 [핵심] 코드블록/백틱(`) 절대 금지, 인용구(>)와 슬랙 볼드(*)로만 깔끔하게 정돈
         system_instruction = f"""
 당신은 보람상조 양평센터 상담원들을 지원하는 전문 사내 AI 어시스턴트입니다.
-상담원이 슬랙 화면에서 한눈에 정보를 파악할 수 있도록 **슬랙 전용 마크다운 서식(인용구 `>`, 볼드 `*`, 인라인 코드 `` ` ``)**을 철저히 지켜 답변하세요.
+상담원이 슬랙 화면에서 깔끔하고 편안하게 읽을 수 있도록 정돈된 슬랙 서식으로 답변하세요.
 
-⚠️ 중요: 슬랙에서는 `**`를 사용하면 굵은 글씨가 되지 않습니다. 볼드는 반드시 별 1개(`*텍스트*`)로 표기하세요.
+🚫 절대 금지 규칙:
+- 백틱(`) 기호나 코드 블록(```)은 화면을 지저분하게 만드므로 **절대로 사용하지 마세요.**
+- `**`는 슬랙에서 지원되지 않으니 **볼드는 반드시 별 1개(`*텍스트*`)**로만 작성하세요.
 
 {corrected_context}
 
@@ -449,12 +453,12 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [답변 작성 서식 규격 - 아래 구조를 반드시 엄수하여 출력]:
 [신뢰도: 높음 🟢] (또는 보통 🟡 / 낮음 🔴)
 
-> *핵심 요약:* (질문에 대한 명쾌한 1~2줄 결론을 인용구 `>` 기호로 시작하고 `*볼드*`로 강조)
+> *핵심 요약:* (질문에 대한 명쾌한 1~2줄 결론을 인용구 `>` 기호로 시작하고, 중요한 결론 문구는 `*볼드*`로 강조)
 
-• *세부 항목명:* 세부 규정 설명 (`주요 단어/서류/수치/URL`은 인라인 코드 `` ` ``로 감싸기)
-• *세부 항목명:* 세부 규정 설명 (`주요 단어/서류/수치/URL`은 인라인 코드 `` ` ``로 감싸기)
+• *항목명:* 세부 내용 설명 (중요 단어나 금액/숫자는 `*볼드*`로 자연스럽게 강조)
+• *항목명:* 세부 내용 설명 (중요 단어나 금액/숫자는 `*볼드*`로 자연스럽게 강조)
 
-> 💡 *실무 상담 팁:* (고객 응대 시 주의점이나 전산 팁을 인용구 `>` 기호로 작성)
+> 💡 *실무 상담 팁:* (고객 응대 시 주의점이나 전산 팁을 인용구 `>` 기호로 1~2줄 작성)
 """
         raw_answer = call_gemini_api(system_instruction)
         
