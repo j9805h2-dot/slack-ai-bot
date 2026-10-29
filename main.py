@@ -313,7 +313,8 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_id: str) -> dict:
+# 💡 [핵심] 버튼이 포함된 메시지 타임스탬프(message_ts)를 인자로 받아 private_metadata에 저장
+def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_id: str, message_ts: str = "") -> dict:
     return {
         "type": "modal",
         "callback_id": "submit_inquiry_modal",
@@ -324,7 +325,8 @@ def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "user_id": user_id,
-            "user_name": user_name
+            "user_name": user_name,
+            "message_ts": message_ts
         }),
         "blocks": [
             {
@@ -520,6 +522,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
+# 💡 [핵심] 버튼이 포함된 봇의 메시지 ts(btn_msg_ts)를 정확히 타겟팅하여 수정
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -543,33 +546,35 @@ def bg_process_submission(view: dict):
 
     channel_id = meta.get("channel_id")
     thread_ts = meta.get("thread_ts")
+    btn_msg_ts = meta.get("message_ts")
     
-    if slack_client and channel_id and thread_ts:
-        # 💡 [핵심 추가] 모달 제출 완료 시 기존 AI 메시지의 [질의 접수] 버튼 제거
-        try:
-            res = slack_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=1)
-            msgs = res.get("messages", [])
-            if msgs:
-                orig_text = msgs[0].get("text", "")
-                orig_ts = msgs[0].get("ts")
-                slack_client.chat_update(
-                    channel=channel_id,
-                    ts=orig_ts,
-                    text=orig_text,
-                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": orig_text}}]
-                )
-        except Exception as e:
-            print(f"⚠️ 질의 버튼 제거 실패: {e}")
+    if slack_client and channel_id:
+        # 버튼이 있던 봇 메시지의 버튼 블록 제거
+        if btn_msg_ts:
+            try:
+                res = slack_client.conversations_replies(channel=channel_id, ts=btn_msg_ts, limit=1)
+                msgs = res.get("messages", [])
+                if msgs:
+                    orig_text = msgs[0].get("text", "")
+                    slack_client.chat_update(
+                        channel=channel_id,
+                        ts=btn_msg_ts,
+                        text=orig_text,
+                        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": orig_text}}]
+                    )
+            except Exception as e:
+                print(f"⚠️ 질의 버튼 제거 실패: {e}")
 
         # 안내 문구 전송
-        try:
-            slack_client.chat_postMessage(
-                channel=channel_id, 
-                thread_ts=thread_ts, 
-                text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~"
-            )
-        except Exception:
-            pass
+        if thread_ts:
+            try:
+                slack_client.chat_postMessage(
+                    channel=channel_id, 
+                    thread_ts=thread_ts, 
+                    text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~"
+                )
+            except Exception:
+                pass
 
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request, background_tasks: BackgroundTasks):
@@ -589,6 +594,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 if action_id == "open_inquiry_modal_btn":
                     trigger_id = payload.get("trigger_id")
                     channel_id = payload.get("channel", {}).get("id")
+                    message_ts = payload.get("message", {}).get("ts", "")  # 💡 버튼이 달린 메시지 ts 추출
                     user_info = payload.get("user", {})
                     user_id = user_info.get("id")
                     user_name = user_info.get("name", "상담사")
@@ -603,7 +609,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                             print(f"⚠️ 사용자 프로필 조회 실패: {e}")
 
                     if slack_client and trigger_id:
-                        modal_view = build_modal_view_dict(channel_id, raw_val, user_name, user_id)
+                        modal_view = build_modal_view_dict(channel_id, raw_val, user_name, user_id, message_ts)
                         slack_client.views_open(trigger_id=trigger_id, view=modal_view)
                     return Response(status_code=200)
 
