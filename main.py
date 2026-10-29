@@ -32,19 +32,15 @@ print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 # =========================================================================
 # 3. 지식 베이스 연동 설정 (마스터 시트 + 💢대성_질의 시트 실시간 보정 연동)
 # =========================================================================
-# 1) 마스터 규정 지식 베이스 (📚AI_마스터지식)
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv"
-
-# 2) 💢대성_질의 시트 전용 Apps Script 웹앱 URL (로그 저장 및 실시간 보정 데이터 수신용)
 DAESEONG_QNA_WEBAPP_URL = os.environ.get("DAESEONG_WEBAPP_URL") or os.environ.get("LOG_WEBHOOK_URL", "")
 
-KNOWLEDGE_CACHE = []      # 마스터 시트 규정 지식
-CORRECTED_CACHE = []      # 💢대성_질의 시트의 관리자 보정 피드백 (최우선 적용)
+KNOWLEDGE_CACHE = []
+CORRECTED_CACHE = []
 LAST_SYNC_TIME = 0
 
 def fetch_master_knowledge():
-    """📚AI_마스터지식 시트의 전체 규정 로드"""
     global KNOWLEDGE_CACHE
     try:
         res = requests.get(SHEET_CSV_URL, timeout=10)
@@ -63,32 +59,25 @@ def fetch_master_knowledge():
         print(f"❌ 📚AI_마스터지식 로드 실패: {e}")
 
 def fetch_corrected_knowledge():
-    """💢대성_질의 시트(💬실시간_질의로그 + 📋상담사 질의)의 관리자 실시간 보정 데이터 로드"""
     global CORRECTED_CACHE
     if not DAESEONG_QNA_WEBAPP_URL:
-        print("⚠️ 💢대성_질의 웹앱 URL(LOG_WEBHOOK_URL)이 설정되지 않았습니다.")
         return
     try:
-        # Apps Script의 doGet()을 실행하여 시트 내 최신 보정 데이터를 JSON으로 가져옵니다.
         res = requests.get(DAESEONG_QNA_WEBAPP_URL, timeout=12)
         if res.status_code == 200:
             data = res.json()
             CORRECTED_CACHE = data.get("data", [])
             print(f"✅ [2/2] 💢대성_질의 실시간 관리자 보정 지식 로드 완료: {len(CORRECTED_CACHE)}건")
-        else:
-            print(f"⚠️ 💢대성_질의 보정 지식 요청 비정상 응답 코드: {res.status_code}")
     except Exception as e:
         print(f"⚠️ 💢대성_질의 실시간 보정 지식 통신 실패: {e}")
 
 def refresh_all_knowledge():
-    """60초 주기로 마스터 규정과 💢대성_질의 시트 보정 내용을 실시간 동기화"""
     global LAST_SYNC_TIME
     print("\n🔄 지식 베이스 실시간 갱신 시작...")
     fetch_master_knowledge()
     fetch_corrected_knowledge()
     LAST_SYNC_TIME = time.time()
 
-# 봇 구동 시 1차 즉시 로드
 refresh_all_knowledge()
 
 def normalize_text(text: str) -> str:
@@ -96,8 +85,6 @@ def normalize_text(text: str) -> str:
 
 def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
     global KNOWLEDGE_CACHE, CORRECTED_CACHE, LAST_SYNC_TIME
-    
-    # 마지막 동기화로부터 60초가 지나면 💢대성_질의 시트의 보정 데이터를 자동으로 다시 긁어옴
     if time.time() - LAST_SYNC_TIME > 60:
         refresh_all_knowledge()
 
@@ -121,8 +108,8 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
         return [it for _, it in results[:top_k]]
 
     return {
-        "corrected_rules": score_items(CORRECTED_CACHE),  # 1순위 관리자 보정 지침
-        "master_rules": score_items(KNOWLEDGE_CACHE)       # 2순위 기본 규정 지식
+        "corrected_rules": score_items(CORRECTED_CACHE),
+        "master_rules": score_items(KNOWLEDGE_CACHE)
     }
 
 # 4. 볼드체 변환 유틸
@@ -164,7 +151,7 @@ def call_gemini_api(prompt: str) -> str:
 
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(원인: {last_error_msg[:100]})"
 
-# 6. 스레드 히스토리 및 질문 횟수 카운트
+# 6. 스레드 문맥 조회
 def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
     if not slack_client or not thread_ts:
         return "", "", 1
@@ -191,11 +178,8 @@ def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
         print(f"⚠️ 스레드 문맥 조회 예외: {e}")
         return "", "", 1
 
-# 7-1. 일상 대화 판별 (업무 키워드 포함 시 무조건 제외)
 def check_casual_intent(text: str) -> bool:
     clean = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
-    
-    # 🚨 업무 및 규정 질문 키워드는 절대 일상 대화로 빠지지 않음
     business_keywords = [
         "본인확인", "확인해야", "확인방법", "연체", "해약", "환급", "양도", 
         "명의", "프로세스", "절차", "서류", "발급", "신청", "인증", "기준", "어떻게"
@@ -213,13 +197,10 @@ def check_casual_intent(text: str) -> bool:
         return True
     return False
 
-# 7-2. 관리자 질의 키워드 감지 유틸
 def check_manual_escalation_intent(text: str) -> bool:
     keywords = ["팀장", "관리자", "sv", "에스브이", "상급자", "물어볼", "물어봐야", "물어볼래", "확인해볼", "올려볼", "질의서", "질문있어", "질문 있어"]
-    normalized = text.lower()
-    return any(k in normalized for k in keywords)
+    return any(k in text.lower() for k in keywords)
 
-# 8. 질의로그 시트 전송
 def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, sub_q: str, answer: str):
     if not DAESEONG_QNA_WEBAPP_URL:
         return
@@ -238,7 +219,6 @@ def log_to_google_sheet(gubun: str, thread_ts: str, user_id: str, first_q: str, 
     except Exception as e:
         print(f"⚠️ 질의로그 시트 전송 실패: {e}")
 
-# 9. 모달 UI 생성 함수
 def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_id: str) -> dict:
     return {
         "type": "modal",
@@ -257,68 +237,41 @@ def build_modal_view_dict(channel_id: str, thread_ts: str, user_name: str, user_
                 "type": "input",
                 "block_id": "team_block",
                 "label": {"type": "plain_text", "text": "소속팀 *"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "team_input",
-                    "placeholder": {"type": "plain_text", "text": "예: 1팀, 6팀"}
-                }
+                "element": {"type": "plain_text_input", "action_id": "team_input", "placeholder": {"type": "plain_text", "text": "예: 1팀, 6팀"}}
             },
             {
                 "type": "input",
                 "block_id": "author_block",
                 "label": {"type": "plain_text", "text": "상담사명(작성자) *"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "author_input",
-                    "initial_value": user_name if user_name else "",
-                    "placeholder": {"type": "plain_text", "text": "성함을 입력하세요."}
-                }
+                "element": {"type": "plain_text_input", "action_id": "author_input", "initial_value": user_name or "", "placeholder": {"type": "plain_text", "text": "성함을 입력하세요."}}
             },
             {
                 "type": "input",
                 "block_id": "contract_block",
                 "label": {"type": "plain_text", "text": "계약번호 / 연락처 *"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "contract_input",
-                    "placeholder": {"type": "plain_text", "text": "계약번호 또는 전화번호"}
-                }
+                "element": {"type": "plain_text_input", "action_id": "contract_input", "placeholder": {"type": "plain_text", "text": "계약번호 또는 전화번호"}}
             },
             {
                 "type": "input",
                 "block_id": "name_block",
                 "label": {"type": "plain_text", "text": "회원명 *"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "name_input",
-                    "placeholder": {"type": "plain_text", "text": "회원명을 입력하세요."}
-                }
+                "element": {"type": "plain_text_input", "action_id": "name_input", "placeholder": {"type": "plain_text", "text": "회원명을 입력하세요."}}
             },
             {
                 "type": "input",
                 "block_id": "customerQ_block",
                 "label": {"type": "plain_text", "text": "고객 문의 내용(고객) *"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "customerQ_input",
-                    "placeholder": {"type": "plain_text", "text": "고객이 인입 시 문의한 핵심 내용"}
-                }
+                "element": {"type": "plain_text_input", "action_id": "customerQ_input", "placeholder": {"type": "plain_text", "text": "고객이 인입 시 문의한 핵심 내용"}}
             },
             {
                 "type": "input",
                 "block_id": "myQ_block",
                 "label": {"type": "plain_text", "text": "문의 내용(내가 궁금한 점) *"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "myQ_input",
-                    "multiline": True,
-                    "placeholder": {"type": "plain_text", "text": "확인받고자 하는 구체적인 내용 작성"}
-                }
+                "element": {"type": "plain_text_input", "action_id": "myQ_input", "multiline": True, "placeholder": {"type": "plain_text", "text": "확인받고자 하는 구체적인 내용 작성"}}
             }
         ]
     }
 
-# 10. 질문 처리 및 응답 전송 로직
 def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str, user_id: str):
     is_thread_reply = bool(thread_ts and thread_ts != ts)
     target_ts = thread_ts if is_thread_reply else ts
@@ -331,42 +284,26 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
 
-    # 1) 일상 대화/인사/감사 감지 시 -> 단독 격려 응답 (버튼 미부착)
     if check_casual_intent(clean_prompt):
         casual_prompt = f"""
 당신은 보람상조 양평센터 상담원들을 항상 곁에서 응원하고 돕는 친절하고 다정한 사내 AI 동료 '대성봇'입니다.
 상담원의 인사나 리액션에 맞춰 기분 좋은 에너지와 따뜻한 공감을 담아 자연스럽게 화답해 주세요.
-
-[응답 가이드]:
-- 인사를 건네면 반갑고 활기차게 맞이해 주세요.
-- 감사를 표하면 뿌듯한 마음과 함께 언제든 돕겠다는 다정한 멘트를 건네세요.
-- 업무 마감이나 퇴근, 수고 인사를 하면 따뜻한 위로와 응원을 전하세요.
-- 이모지(😊, ✨, 👍, 🍀 등)를 적절히 섞어 1~2줄 내외로 간결하고 기분 좋게 답변하세요.
-- 불필요한 사과나 시스템적인 문구는 절대 넣지 마세요.
-
 상담원의 말: "{clean_prompt}"
 """
         answer = call_gemini_api(casual_prompt)
-
         if slack_client:
             try:
                 slack_client.reactions_remove(channel=channel, timestamp=ts, name="eyes")
             except Exception:
                 pass
             try:
-                slack_client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=target_ts,
-                    text=answer
-                )
+                slack_client.chat_postMessage(channel=channel, thread_ts=target_ts, text=answer)
                 slack_client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
             except Exception as e:
                 print(f"❌ 슬랙 전송 실패: {e}")
-
         log_to_google_sheet("일상대화", target_ts, user_id, clean_prompt, "", answer)
         return
 
-    # 2) 정규 업무 질의 처리
     first_q_text, thread_history, user_q_count = ("", "", 1)
     if is_thread_reply:
         first_q_text, thread_history, user_q_count = get_thread_context_and_count(channel, thread_ts)
@@ -383,7 +320,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
         search_target = f"{first_q_clean} {clean_prompt}" if is_thread_reply else clean_prompt
         knowledge = search_relevant_knowledge(search_target)
 
-        # 🚨 💢대성_질의 시트에서 가져온 관리자 보정 지침을 프롬프트 최상단에 1순위로 배치
         corrected_context = ""
         if knowledge.get('corrected_rules'):
             corrected_context = f"""
@@ -416,7 +352,6 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 4. 상담사가 고객과 통화 중 바로 참고할 수 있도록 불릿 포인트와 볼드체를 활용해 핵심만 간결하게 작성하세요.
 """
         base_answer = call_gemini_api(system_instruction)
-
         if user_q_count >= 3:
             answer = f"{base_answer}\n\n---\n*안내*: 해당 문의는 상황에 따른 세부 확인이 필요할 수 있으니, 아래 버튼을 통해 관리자(SV)님께 직접 질의서를 접수해 보시는 것을 권장해 드립니다."
         else:
@@ -435,19 +370,8 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
                 {
                     "type": "actions",
                     "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "📋 관리자(SV) 질의 접수"},
-                            "style": "primary",
-                            "action_id": "open_inquiry_modal_btn",
-                            "value": target_ts
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "❌ 작성 취소 (해결됨)"},
-                            "action_id": "dismiss_inquiry_btn",
-                            "value": target_ts
-                        }
+                        {"type": "button", "text": {"type": "plain_text", "text": "📋 관리자(SV) 질의 접수"}, "style": "primary", "action_id": "open_inquiry_modal_btn", "value": target_ts},
+                        {"type": "button", "text": {"type": "plain_text", "text": "❌ 작성 취소 (해결됨)"}, "action_id": "dismiss_inquiry_btn", "value": target_ts}
                     ]
                 }
             ]
@@ -456,12 +380,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
             post_kwargs = {}
 
         try:
-            slack_client.chat_postMessage(
-                channel=channel,
-                thread_ts=target_ts,
-                text=answer,
-                **post_kwargs
-            )
+            slack_client.chat_postMessage(channel=channel, thread_ts=target_ts, text=answer, **post_kwargs)
             slack_client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
         except Exception as e:
             print(f"❌ 슬랙 전송 실패: {e}")
@@ -469,6 +388,81 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
+
+# =========================================================================
+# 💡 [핵심 추가] EC2 기반 Gemini 드라이브 파일 고속 OCR & 마스터 시트 적재
+# =========================================================================
+def parse_file_with_gemini(file_bytes: bytes, mime_type: str, file_name: str) -> str:
+    """Gemini Multimodal API를 사용하여 PDF/이미지/PPTX 본문 및 Q&A 규정을 고속 추출"""
+    import base64
+    global api_key_index
+    if not GEMINI_API_KEYS:
+        return ""
+
+    b64_data = base64.b64encode(file_bytes).decode('utf-8')
+    prompt = f"""
+이 파일('{file_name}')은 보람상조 양평센터 상담원을 위한 사내 업무 매뉴얼 및 규정 자료입니다.
+문서 내용을 꼼꼼히 분석하여 상담원들이 고객 문의 시 참고할 수 있도록 주요 규정, 절차, Q&A 내용을 상세하고 구조화된 텍스트로 요약/추출해 주세요.
+불필요한 서식이나 디자인 설명은 제외하고, 실무 규칙과 단계별 프로세스 위주로 정리하세요.
+"""
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64_data}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096}
+    }
+
+    current_key = GEMINI_API_KEYS[api_key_index]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={current_key}"
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=60)
+        if res.status_code == 200:
+            data = res.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            print(f"⚠️ Gemini 파싱 실패 ({file_name}): {res.status_code} - {res.text[:100]}")
+    except Exception as e:
+        print(f"❌ Gemini 파싱 예외 ({file_name}): {e}")
+    return ""
+
+def bg_process_drive_sync(payload: dict):
+    """Apps Script에서 보낸 파일 바이너리를 받아 Gemini로 분석하고 마스터 시트로 콜백 저장"""
+    file_name = payload.get("fileName", "")
+    mime_type = payload.get("mimeType", "")
+    b64_contents = payload.get("fileBase64", "")
+    
+    if not b64_contents:
+        return
+
+    import base64
+    file_bytes = base64.b64decode(b64_contents)
+    print(f"🚀 [EC2 Gemini 분석 시작] {file_name} ({len(file_bytes)} bytes)")
+
+    extracted_text = parse_file_with_gemini(file_bytes, mime_type, file_name)
+    if extracted_text and DAESEONG_QNA_WEBAPP_URL:
+        # Apps Script 웹앱으로 분석 결과를 전달하여 마스터 시트에 최종 적재
+        save_payload = {
+            "action": "append_master_knowledge",
+            "title": f"[{file_name}] 사내 업무 규정",
+            "content": extracted_text,
+            "source": f"드라이브문서({file_name})"
+        }
+        try:
+            res = requests.post(DAESEONG_QNA_WEBAPP_URL, json=save_payload, timeout=15)
+            print(f"✅ [마스터 시트 적재 완료] {file_name} -> 응답: {res.status_code}")
+        except Exception as e:
+            print(f"❌ 마스터 시트 적재 전송 오류: {e}")
+
+@app.post("/sync/drive-file")
+async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
+    """Apps Script에서 호출하는 엔드포인트: 무거운 파일은 EC2 백그라운드 태스크로 넘김"""
+    data = await request.json()
+    background_tasks.add_task(bg_process_drive_sync, data)
+    return {"status": "accepted", "message": f"{data.get('fileName')} Gemini 분석 백그라운드 작업 등록 완료"}
 
 # 11. Slack Events 엔드포인트
 PROCESSED_EVENT_IDS = OrderedDict()
@@ -502,7 +496,7 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 12. 모달 제출 후 시트 전송 처리
+# 12. 모달 제출 처리
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
@@ -517,7 +511,6 @@ def bg_process_submission(view: dict):
     channel_id = meta.get("channel_id")
     thread_ts = meta.get("thread_ts")
     user_id = meta.get("user_id", "")
-
     author_val = f"<@{user_id}>" if user_id else author_text
 
     sheet_payload = {
@@ -558,7 +551,6 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
 
         payload = json.loads(payload_raw)
 
-        # 1) 버튼 클릭
         if payload.get("type") == "block_actions":
             for action in payload.get("actions", []):
                 action_id = action.get("action_id")
@@ -585,8 +577,6 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                             api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
                             if not api_res.get("ok"):
                                 print(f"❌ views.open 실패: {api_res.get('error')}")
-                            else:
-                                print(f"✅ 모달 팝업 성공! (실명: {user_name}, ID: {user_id})")
                         except Exception as e:
                             print(f"❌ views_open 호출 예외: {e}")
 
@@ -595,27 +585,22 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 elif action_id == "dismiss_inquiry_btn":
                     channel_id = payload.get("channel", {}).get("id")
                     user_id = payload.get("user", {}).get("id")
-                    
                     message_info = payload.get("message", {})
                     message_ts = message_info.get("ts")
                     original_text = message_info.get("text", "")
 
                     if slack_client and channel_id:
-                        # 1단계: 기존 메시지에서 버튼 블록(blocks) 제거
                         if message_ts:
                             try:
                                 slack_client.chat_update(
                                     channel=channel_id,
                                     ts=message_ts,
                                     text=original_text,
-                                    blocks=[
-                                        {"type": "section", "text": {"type": "mrkdwn", "text": original_text}}
-                                    ]
+                                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": original_text}}]
                                 )
                             except Exception as e:
                                 print(f"⚠️ 버튼 제거 실패: {e}")
 
-                        # 2단계: 종료 알림 댓글 발송
                         try:
                             slack_client.chat_postMessage(
                                 channel=channel_id,
@@ -627,7 +612,6 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
 
                     return Response(status_code=200)
 
-        # 2) 모달 제출
         if payload.get("type") == "view_submission":
             view = payload.get("view", {})
             if view.get("callback_id") == "submit_inquiry_modal":
