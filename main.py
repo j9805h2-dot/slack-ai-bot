@@ -12,12 +12,21 @@ from fastapi.responses import JSONResponse, Response
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 
-# 1. 환경변수 로드
+# 텍스트 추출 라이브러리 (설치 완료 후 동작)
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None
+
 load_dotenv()
 
 app = FastAPI()
 
-# 2. Slack 클라이언트 및 API 키 로드
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 
@@ -30,9 +39,6 @@ for k, v in os.environ.items():
 api_key_index = 0
 print(f"🔑 로드된 Gemini API 키 개수: {len(GEMINI_API_KEYS)}개")
 
-# =========================================================================
-# 3. 지식 베이스 연동 설정 (마스터 시트 + 실시간 관리자 보정 연동)
-# =========================================================================
 MASTER_SHEET_ID = os.environ.get("MASTER_SHEET_ID", "1k-eGv2EFu4GG3H3oKG-Ql9IF-UVD_kZMTjnUiyLqLp4")
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{MASTER_SHEET_ID}/export?format=csv"
 DAESEONG_QNA_WEBAPP_URL = os.environ.get("DAESEONG_WEBAPP_URL") or os.environ.get("LOG_WEBHOOK_URL", "")
@@ -113,11 +119,9 @@ def search_relevant_knowledge(query: str, top_k: int = 5) -> dict:
         "master_rules": score_items(KNOWLEDGE_CACHE)
     }
 
-# 4. 볼드체 변환 유틸
 def convert_to_slack_markdown(text: str) -> str:
     return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
 
-# 5. Gemini API 호출 함수 (실시간 상담 질의 응답용)
 def call_gemini_api(prompt: str) -> str:
     global api_key_index
     if not GEMINI_API_KEYS:
@@ -129,7 +133,7 @@ def call_gemini_api(prompt: str) -> str:
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
     }
 
-    active_models = ["gemini-flash-latest", "gemini-2.0-flash", "gemini-pro-latest"]
+    active_models = ["gemini-flash-latest", "gemini-2.0-flash"]
     max_attempts = len(GEMINI_API_KEYS) * len(active_models)
     last_error_msg = ""
 
@@ -156,7 +160,121 @@ def call_gemini_api(prompt: str) -> str:
 
     return f"죄송합니다. AI 서비스 연결에 일시적인 지연이 발생했습니다.\n(원인: {last_error_msg[:100]})"
 
-# 6. 스레드 문맥 조회
+# =========================================================================
+# 💡 [핵심] EC2 로컬 고속 텍스트 추출 엔진 (429 차단)
+# =========================================================================
+def extract_text_locally(file_bytes: bytes, file_name: str) -> str:
+    """PDF, PPTX 바이너리에서 토큰 소모 없이 순수 텍스트를 로컬 추출"""
+    lower = file_name.lower()
+    text = ""
+    try:
+        if lower.endswith(".pdf") and PdfReader:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for page in reader.pages:
+                t = page.extract_text()
+                if t:
+                    text += t + "\n"
+
+        elif lower.endswith(".pptx") and Presentation:
+            prs = Presentation(io.BytesIO(file_bytes))
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for paragraph in shape.text_frame.paragraphs:
+                            if paragraph.text:
+                                text += paragraph.text + "\n"
+    except Exception as e:
+        print(f"⚠️ 로컬 파일 텍스트 추출 중 경미한 오류 ({file_name}): {e}")
+
+    return text.strip()
+
+def parse_and_refine_text(file_bytes: bytes, mime_type: str, file_name: str) -> str:
+    """로컬 텍스트 추출 후, 필요 시 경량 Gemini 요약 진행 (429 방어)"""
+    global api_key_index
+
+    # 1. 먼저 EC2 로컬에서 텍스트를 무료로 직접 추출
+    raw_text = extract_text_locally(file_bytes, file_name)
+
+    # 텍스트가 정상 추출된 경우: 그대로 쓰거나 용량이 너무 클 때만 슬라이싱
+    if raw_text and len(raw_text) > 30:
+        print(f"  ⚡ [로컬 텍스트 추출 성공] {file_name}: {len(raw_text)}글자 추출됨 (API 호출 불필요)")
+        return raw_text
+
+    # 2. 이미지 스캔형 PDF라 텍스트가 안 잡힐 때만 Gemini 비전 최소 호출
+    print(f"  🔍 [스캔 이미지 PDF 감지] Gemini 경량 파싱 진행: {file_name}")
+    if not GEMINI_API_KEYS:
+        return ""
+
+    b64_data = base64.b64encode(file_bytes).decode('utf-8')
+    prompt = f"이 문서('{file_name}')의 본문 규정과 주요 안내 내용을 실무자가 알 수 있도록 상세히 텍스트로 추출해 주세요."
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64_data}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3000}
+    }
+
+    candidate_models = ["gemini-flash-latest", "gemini-2.0-flash"]
+    for _ in range(len(GEMINI_API_KEYS)):
+        current_key = GEMINI_API_KEYS[api_key_index]
+        for model in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={current_key}"
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=40)
+                if res.status_code == 200:
+                    return res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                elif res.status_code == 429:
+                    api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
+                    time.sleep(2)
+                    break
+            except Exception:
+                pass
+        api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
+
+    return ""
+
+def bg_process_drive_sync(payload: dict):
+    file_name = payload.get("fileName", "")
+    mime_type = payload.get("mimeType", "")
+    b64_contents = payload.get("fileBase64", "")
+    
+    if not b64_contents:
+        return
+
+    file_bytes = base64.b64decode(b64_contents)
+    print(f"🚀 [EC2 파일 분석 시작] {file_name} ({len(file_bytes)} bytes)")
+
+    extracted_text = parse_and_refine_text(file_bytes, mime_type, file_name)
+
+    if extracted_text and DAESEONG_QNA_WEBAPP_URL:
+        save_payload = {
+            "action": "append_master_knowledge",
+            "title": f"[{file_name}] 업무 규정",
+            "content": extracted_text,
+            "source": f"드라이브문서({file_name})"
+        }
+        try:
+            res = requests.post(DAESEONG_QNA_WEBAPP_URL, json=save_payload, timeout=20)
+            print(f"✅ [마스터 시트 적재 완료] {file_name} -> 시트 적재 상태: {res.status_code}")
+        except Exception as e:
+            print(f"❌ 마스터 시트 콜백 실패: {e}")
+    else:
+        print(f"⚠️ 텍스트 추출 내용 부족: {file_name}")
+
+@app.post("/sync/drive-file")
+async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+    background_tasks.add_task(bg_process_drive_sync, data)
+    return {"status": "accepted", "message": f"{data.get('fileName')} 작업 등록 완료"}
+
+# =========================================================================
+# 슬랙 이벤트 및 인터랙션 핸들러 유지
+# =========================================================================
 def get_thread_context_and_count(channel: str, thread_ts: str) -> tuple:
     if not slack_client or not thread_ts:
         return "", "", 1
@@ -290,22 +408,15 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     clean_prompt = re.sub(r'^\[질의-AI\]\s*', '', user_text).strip()
 
     if check_casual_intent(clean_prompt):
-        casual_prompt = f"""
-당신은 보람상조 양평센터 상담원들을 항상 곁에서 응원하고 돕는 친절하고 다정한 사내 AI 동료 '대성봇'입니다.
-상담원의 인사나 리액션에 맞춰 기분 좋은 에너지와 따뜻한 공감을 담아 자연스럽게 화답해 주세요.
-상담원의 말: "{clean_prompt}"
-"""
+        casual_prompt = f"상담원의 인사나 반응에 다정하게 화답해 주세요. 상담원 말: '{clean_prompt}'"
         answer = call_gemini_api(casual_prompt)
         if slack_client:
             try:
                 slack_client.reactions_remove(channel=channel, timestamp=ts, name="eyes")
-            except Exception:
-                pass
-            try:
                 slack_client.chat_postMessage(channel=channel, thread_ts=target_ts, text=answer)
                 slack_client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
-            except Exception as e:
-                print(f"❌ 슬랙 전송 실패: {e}")
+            except Exception:
+                pass
         log_to_google_sheet("일상대화", target_ts, user_id, clean_prompt, "", answer)
         return
 
@@ -327,10 +438,7 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 
         corrected_context = ""
         if knowledge.get('corrected_rules'):
-            corrected_context = f"""
-[⚠️ 관리자 최우선 보정 지침 - 기존 마스터 규정보다 아래 내용을 무조건 최우선 적용할 것]:
-{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}
-"""
+            corrected_context = f"[⚠️ 관리자 최우선 보정 지침]:\n{json.dumps(knowledge['corrected_rules'], ensure_ascii=False, indent=2)}\n"
 
         system_instruction = f"""
 당신은 보람상조 양평센터 상담원들을 지원하는 사내 AI 어시스턴트입니다.
@@ -347,20 +455,13 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
 [질문]:
 {clean_prompt}
 
-[답변 작성 원칙]:
-1. [⚠️ 관리자 최우선 보정 지침]에 기재된 피드백이나 보정 내용이 있다면 기존 규정보다 무조건 1순위로 채택하여 답변하세요.
-2. 질문에 '본인확인' 키워드가 있거나 관련 문의인 경우:
-   - 반드시 **사내 본인확인 프로세스 기준(성함, 생년월일, 연락처, 회원번호 등 필수 확인 항목 및 대리인 인입 시 위임 기준)**을 단계별로 엄격하게 설명하세요.
-3. 질문에 '프로세스', '절차', '순서', '방법', '단계' 등의 키워드가 포함된 경우:
-   - 반드시 **실무자가 취해야 할 단계별 진행 순서(1단계 ➔ 2단계 ➔ 3단계...)**를 최우선으로 먼저 명확히 제시하세요.
-   - 혜택 중단/복구, 약관 조항, 환급금 주의사항 등은 단계별 프로세스 하단에 **[참고 및 고객 안내 사항]** 형태로 구분하여 보조 정보로 제공하세요.
-4. 상담사가 고객과 통화 중 바로 참고할 수 있도록 불릿 포인트와 볼드체를 활용해 핵심만 간결하게 작성하세요.
+[원칙]:
+1. 관리자 보정 지침이 있으면 1순위로 적용하세요.
+2. 질문에 '본인확인'이 포함되면 본인확인 필수 항목(성함, 생년월일, 연락처 등)을 명시하세요.
+3. '절차', '순서', '방법' 질문은 1단계 -> 2단계 순서로 먼저 명확히 안내하세요.
 """
         base_answer = call_gemini_api(system_instruction)
-        if user_q_count >= 3:
-            answer = f"{base_answer}\n\n---\n*안내*: 해당 문의는 상황에 따른 세부 확인이 필요할 수 있으니, 아래 버튼을 통해 관리자(SV)님께 직접 질의서를 접수해 보시는 것을 권장해 드립니다."
-        else:
-            answer = base_answer
+        answer = f"{base_answer}\n\n---\n*안내*: 세부 확인이 필요하시면 아래 버튼으로 관리자 질의를 접수하세요." if user_q_count >= 3 else base_answer
 
     if slack_client:
         try:
@@ -388,106 +489,12 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
             slack_client.chat_postMessage(channel=channel, thread_ts=target_ts, text=answer, **post_kwargs)
             slack_client.reactions_add(channel=channel, timestamp=ts, name="white_check_mark")
         except Exception as e:
-            print(f"❌ 슬랙 전송 실패: {e}")
+            print(f"❌ 슬랙 발송 실패: {e}")
 
     gubun_val = f"대댓글({user_q_count}회차)" if is_thread_reply else "최초답변"
     sub_q_val = clean_prompt if is_thread_reply else ""
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
 
-# =========================================================================
-# 💡 [429 Quota Exceeded 방어판] 키 자동 교체 & 지수 백오프 지원 멀티모달 파서
-# =========================================================================
-def parse_file_with_gemini(file_bytes: bytes, mime_type: str, file_name: str) -> str:
-    """Gemini API 429 한도 발생 시 키 전환 및 백오프 대기로 끝까지 파싱 완수"""
-    global api_key_index
-    if not GEMINI_API_KEYS:
-        return ""
-
-    b64_data = base64.b64encode(file_bytes).decode('utf-8')
-    prompt = f"""
-이 파일('{file_name}')은 보람상조 양평센터 상담원을 위한 사내 업무 매뉴얼 및 규정 자료입니다.
-문서 내용을 꼼꼼히 분석하여 상담원들이 고객 문의 시 참고할 수 있도록 주요 규정, 절차, Q&A 내용을 상세하고 구조화된 텍스트로 추출 및 정리해 주세요.
-불필요한 서식 설명은 제외하고, 실무 규칙과 단계별 프로세스 위주로 작성하세요.
-"""
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": b64_data}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096}
-    }
-
-    candidate_models = ["gemini-flash-latest", "gemini-2.0-flash"]
-    total_keys = len(GEMINI_API_KEYS)
-    max_retries = total_keys * 2  # 모든 키 순환 후 1회 추가 대기 재시도
-
-    for attempt in range(max_retries):
-        current_key = GEMINI_API_KEYS[api_key_index]
-        for model_name in candidate_models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={current_key}"
-            try:
-                res = requests.post(url, headers=headers, json=payload, timeout=60)
-                if res.status_code == 200:
-                    data = res.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                elif res.status_code == 429:
-                    print(f"⏳ 429 한도 감지 (키 #{api_key_index+1} 소진). 다음 API 키로 전환...")
-                    api_key_index = (api_key_index + 1) % total_keys
-                    time.sleep(2)
-                    break
-                else:
-                    print(f"⚠️ Gemini 응답 오류 ({file_name}, {model_name}): {res.status_code}")
-            except Exception as e:
-                print(f"❌ Gemini 파싱 예외 ({file_name}, {model_name}): {e}")
-
-        # 모든 키가 한 바퀴 돌았을 때 6초간 RPM 쿨다운
-        if (attempt + 1) % total_keys == 0:
-            print("⏳ 모든 등록 키의 분당 쿼터(RPM) 쿨다운 대기 중 (6초)...")
-            time.sleep(6)
-
-    return ""
-
-def bg_process_drive_sync(payload: dict):
-    """Apps Script에서 보낸 파일 바이너리를 받아 Gemini로 분석하고 마스터 시트로 콜백 저장"""
-    file_name = payload.get("fileName", "")
-    mime_type = payload.get("mimeType", "")
-    b64_contents = payload.get("fileBase64", "")
-    
-    if not b64_contents:
-        return
-
-    file_bytes = base64.b64decode(b64_contents)
-    print(f"🚀 [EC2 Gemini 분석 시작] {file_name} ({len(file_bytes)} bytes)")
-
-    extracted_text = parse_file_with_gemini(file_bytes, mime_type, file_name)
-    if extracted_text and DAESEONG_QNA_WEBAPP_URL:
-        save_payload = {
-            "action": "append_master_knowledge",
-            "title": f"[{file_name}] 사내 업무 규정",
-            "content": extracted_text,
-            "source": f"드라이브문서({file_name})"
-        }
-        try:
-            res = requests.post(DAESEONG_QNA_WEBAPP_URL, json=save_payload, timeout=15)
-            print(f"✅ [마스터 시트 적재 완료] {file_name} -> 응답: {res.status_code}")
-        except Exception as e:
-            print(f"❌ 마스터 시트 적재 전송 오류: {e}")
-    else:
-        print(f"⚠️ [파싱 내용 없음 또는 전송 스킵] {file_name}")
-
-@app.post("/sync/drive-file")
-async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
-    """Apps Script에서 호출하는 엔드포인트: 파일 분석 백그라운드 태스크 등록"""
-    data = await request.json()
-    background_tasks.add_task(bg_process_drive_sync, data)
-    return {"status": "accepted", "message": f"{data.get('fileName')} Gemini 분석 백그라운드 작업 등록 완료"}
-
-# =========================================================================
-# 7. Slack Events 엔드포인트
-# =========================================================================
 PROCESSED_EVENT_IDS = OrderedDict()
 
 @app.post("/slack/events")
@@ -519,32 +526,19 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok"}
 
-# 8. 모달 제출 처리
 def bg_process_submission(view: dict):
     values = view.get("state", {}).get("values", {})
     meta = json.loads(view.get("private_metadata", "{}"))
 
-    team = values.get("team_block", {}).get("team_input", {}).get("value", "")
-    author_text = values.get("author_block", {}).get("author_input", {}).get("value", "")
-    contract = values.get("contract_block", {}).get("contract_input", {}).get("value", "")
-    name = values.get("name_block", {}).get("name_input", {}).get("value", "")
-    customer_q = values.get("customerQ_block", {}).get("customerQ_input", {}).get("value", "")
-    my_q = values.get("myQ_block", {}).get("myQ_input", {}).get("value", "")
-
-    channel_id = meta.get("channel_id")
-    thread_ts = meta.get("thread_ts")
-    user_id = meta.get("user_id", "")
-    author_val = f"<@{user_id}>" if user_id else author_text
-
     sheet_payload = {
         "action": "escalate",
-        "team": team,
-        "author": author_val,
-        "contract": contract,
-        "name": name,
-        "customerQ": customer_q,
-        "myQ": my_q,
-        "slack_thread_key": f"{channel_id}|{thread_ts}"
+        "team": values.get("team_block", {}).get("team_input", {}).get("value", ""),
+        "author": f"<@{meta.get('user_id', '')}>" if meta.get("user_id") else values.get("author_block", {}).get("author_input", {}).get("value", ""),
+        "contract": values.get("contract_block", {}).get("contract_input", {}).get("value", ""),
+        "name": values.get("name_block", {}).get("name_input", {}).get("value", ""),
+        "customerQ": values.get("customerQ_block", {}).get("customerQ_input", {}).get("value", ""),
+        "myQ": values.get("myQ_block", {}).get("myQ_input", {}).get("value", ""),
+        "slack_thread_key": f"{meta.get('channel_id')}|{meta.get('thread_ts')}"
     }
 
     if DAESEONG_QNA_WEBAPP_URL:
@@ -553,17 +547,14 @@ def bg_process_submission(view: dict):
         except Exception as e:
             print(f"⚠️ 대장 전송 실패: {e}")
 
+    channel_id = meta.get("channel_id")
+    thread_ts = meta.get("thread_ts")
     if slack_client and channel_id and thread_ts:
         try:
-            slack_client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~"
-            )
-        except Exception as e:
-            print(f"⚠️ 완료 알림 실패: {e}")
+            slack_client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="전송 완료. 관리자가 확인하고 답변을 드릴 때 까지 1~2일 정도 소요될 수 있는 점 양해 부탁 드려요~")
+        except Exception:
+            pass
 
-# 9. Slack Interactivity 엔드포인트
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -587,52 +578,20 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                     user_name = user_info.get("name", "상담사")
 
                     if slack_client and trigger_id:
-                        try:
-                            u_info = slack_client.users_info(user=user_id)
-                            if u_info.get("ok"):
-                                profile = u_info["user"].get("profile", {})
-                                user_name = profile.get("display_name") or profile.get("real_name") or u_info["user"].get("real_name") or user_name
-                        except Exception as e:
-                            print(f"⚠️ users_info 조회 예외: {e}")
-
                         modal_view = build_modal_view_dict(channel_id, raw_val, user_name, user_id)
-                        try:
-                            api_res = slack_client.views_open(trigger_id=trigger_id, view=modal_view)
-                            if not api_res.get("ok"):
-                                print(f"❌ views.open 실패: {api_res.get('error')}")
-                        except Exception as e:
-                            print(f"❌ views_open 호출 예외: {e}")
-
+                        slack_client.views_open(trigger_id=trigger_id, view=modal_view)
                     return Response(status_code=200)
 
                 elif action_id == "dismiss_inquiry_btn":
                     channel_id = payload.get("channel", {}).get("id")
                     user_id = payload.get("user", {}).get("id")
-                    message_info = payload.get("message", {})
-                    message_ts = message_info.get("ts")
-                    original_text = message_info.get("text", "")
+                    msg_ts = payload.get("message", {}).get("ts")
+                    orig_text = payload.get("message", {}).get("text", "")
 
                     if slack_client and channel_id:
-                        if message_ts:
-                            try:
-                                slack_client.chat_update(
-                                    channel=channel_id,
-                                    ts=message_ts,
-                                    text=original_text,
-                                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": original_text}}]
-                                )
-                            except Exception as e:
-                                print(f"⚠️ 버튼 제거 실패: {e}")
-
-                        try:
-                            slack_client.chat_postMessage(
-                                channel=channel_id,
-                                thread_ts=raw_val,
-                                text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다."
-                            )
-                        except Exception as e:
-                            print(f"⚠️ dismiss 메시지 발송 실패: {e}")
-
+                        if msg_ts:
+                            slack_client.chat_update(channel=channel_id, ts=msg_ts, text=orig_text, blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": orig_text}}])
+                        slack_client.chat_postMessage(channel=channel_id, thread_ts=raw_val, text=f"👍 <@{user_id}> 상담원님, 문의가 해결되어 질의서 접수를 종료합니다.")
                     return Response(status_code=200)
 
         if payload.get("type") == "view_submission":
@@ -642,7 +601,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 return JSONResponse(content={"response_action": "clear"})
 
     except Exception as err:
-        print(f"❌ interactive 엔드포인트 예외: {err}")
+        print(f"❌ interactive 예외: {err}")
         return Response(status_code=200)
 
     return Response(status_code=200)
