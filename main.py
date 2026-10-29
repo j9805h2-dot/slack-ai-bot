@@ -130,7 +130,7 @@ def call_gemini_api(prompt: str) -> str:
     }
 
     active_models = ["gemini-flash-latest", "gemini-2.0-flash", "gemini-pro-latest"]
-    max_attempts = len(GEMINI_API_KEYS)
+    max_attempts = len(GEMINI_API_KEYS) * len(active_models)
     last_error_msg = ""
 
     for _ in range(max_attempts):
@@ -143,6 +143,10 @@ def call_gemini_api(prompt: str) -> str:
                     data = res.json()
                     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
                     return convert_to_slack_markdown(raw_text)
+                elif res.status_code == 429:
+                    api_key_index = (api_key_index + 1) % len(GEMINI_API_KEYS)
+                    time.sleep(1)
+                    break
                 else:
                     last_error_msg = f"{model} ({res.status_code})"
             except Exception as e:
@@ -391,10 +395,10 @@ def process_slack_question(channel: str, ts: str, thread_ts: str, user_text: str
     log_to_google_sheet(gubun_val, target_ts, user_id, first_q_clean, sub_q_val, answer)
 
 # =========================================================================
-# 💡 [404 에러 방지 모델 폴백 적용] Gemini 드라이브 파일 고속 OCR & 파싱
+# 💡 [429 Quota Exceeded 방어판] 키 자동 교체 & 지수 백오프 지원 멀티모달 파서
 # =========================================================================
 def parse_file_with_gemini(file_bytes: bytes, mime_type: str, file_name: str) -> str:
-    """Gemini Multimodal API를 사용하여 PDF/이미지/PPTX 본문 및 규정을 추출"""
+    """Gemini API 429 한도 발생 시 키 전환 및 백오프 대기로 끝까지 파싱 완수"""
     global api_key_index
     if not GEMINI_API_KEYS:
         return ""
@@ -416,21 +420,33 @@ def parse_file_with_gemini(file_bytes: bytes, mime_type: str, file_name: str) ->
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096}
     }
 
-    # 404 에러 방지를 위해 최신 공식 모델 순차 호출
-    candidate_models = ["gemini-flash-latest", "gemini-2.0-flash", "gemini-pro-latest"]
-    current_key = GEMINI_API_KEYS[api_key_index]
+    candidate_models = ["gemini-flash-latest", "gemini-2.0-flash"]
+    total_keys = len(GEMINI_API_KEYS)
+    max_retries = total_keys * 2  # 모든 키 순환 후 1회 추가 대기 재시도
 
-    for model_name in candidate_models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={current_key}"
-        try:
-            res = requests.post(url, headers=headers, json=payload, timeout=60)
-            if res.status_code == 200:
-                data = res.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            elif res.status_code != 404:
-                print(f"⚠️ Gemini 응답 오류 ({file_name}, {model_name}): {res.status_code} - {res.text[:100]}")
-        except Exception as e:
-            print(f"❌ Gemini 파싱 예외 ({file_name}, {model_name}): {e}")
+    for attempt in range(max_retries):
+        current_key = GEMINI_API_KEYS[api_key_index]
+        for model_name in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={current_key}"
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=60)
+                if res.status_code == 200:
+                    data = res.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                elif res.status_code == 429:
+                    print(f"⏳ 429 한도 감지 (키 #{api_key_index+1} 소진). 다음 API 키로 전환...")
+                    api_key_index = (api_key_index + 1) % total_keys
+                    time.sleep(2)
+                    break
+                else:
+                    print(f"⚠️ Gemini 응답 오류 ({file_name}, {model_name}): {res.status_code}")
+            except Exception as e:
+                print(f"❌ Gemini 파싱 예외 ({file_name}, {model_name}): {e}")
+
+        # 모든 키가 한 바퀴 돌았을 때 6초간 RPM 쿨다운
+        if (attempt + 1) % total_keys == 0:
+            print("⏳ 모든 등록 키의 분당 쿼터(RPM) 쿨다운 대기 중 (6초)...")
+            time.sleep(6)
 
     return ""
 
@@ -459,6 +475,8 @@ def bg_process_drive_sync(payload: dict):
             print(f"✅ [마스터 시트 적재 완료] {file_name} -> 응답: {res.status_code}")
         except Exception as e:
             print(f"❌ 마스터 시트 적재 전송 오류: {e}")
+    else:
+        print(f"⚠️ [파싱 내용 없음 또는 전송 스킵] {file_name}")
 
 @app.post("/sync/drive-file")
 async def sync_drive_file(request: Request, background_tasks: BackgroundTasks):
